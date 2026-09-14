@@ -1,4 +1,5 @@
 #include "dequant.h"
+#include <cstdio>
 
 // ── f16_to_f32 ──
 // IEEE 754 float16: [1 sign][5 exponent][10 mantissa]
@@ -120,5 +121,89 @@ void dequantize_q4_k(const void *src, float *dst, size_t n_elements) {
             q += 32;  // advance to next 32 bytes of quants
             sub_block++;
         }
+    }
+}
+
+// ── dequantize_q6_k ──
+// 6-bit quantization. Each super-block = 210 bytes = 256 weights.
+// The 6-bit value for each weight is split across two arrays:
+//   ql[128] — low 4 bits  (two nibbles per byte)
+//   qh[64]  — high 2 bits (four 2-bit values per byte)
+//
+// The 256 weights are processed in two halves of 128.
+// Within each half, we iterate l=0..31 and extract 4 values per iteration:
+//   - at offsets l+0, l+32, l+64, l+96 within the half
+//
+// Each of the 16 sub-blocks of 16 weights gets its own int8 scale.
+// Formula: float = d * scale * (q6 - 32)
+
+void dequantize_q6_k(const void *src, float *dst, size_t n_elements) {
+    const BlockQ6_K *blocks = (const BlockQ6_K *)src;
+    size_t n_blocks = n_elements / 256;  // 256 weights per super-block
+
+    for (size_t b = 0; b < n_blocks; b++) {
+        const BlockQ6_K *block = &blocks[b];
+        float d = f16_to_f32(block->d);
+
+        const uint8_t *ql = block->ql;
+        const uint8_t *qh = block->qh;
+        const int8_t  *sc = block->scales;
+        float *y = dst + b * 256;
+
+        // process two halves of 128 weights each
+        for (int half = 0; half < 2; half++) {
+            for (int l = 0; l < 32; l++) {
+                // which sub-block (of 16 weights) determines the scale index
+                int is = l / 16;
+
+                // reconstruct 4 six-bit values from ql and qh:
+                //   q1 @ offset l+0:   low nibble of ql[l]    + bits 0-1 of qh[l]
+                //   q2 @ offset l+32:  low nibble of ql[l+32] + bits 2-3 of qh[l]
+                //   q3 @ offset l+64:  high nibble of ql[l]   + bits 4-5 of qh[l]
+                //   q4 @ offset l+96:  high nibble of ql[l+32]+ bits 6-7 of qh[l]
+                int8_t q1 = (int8_t)((ql[l]      & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                int8_t q3 = (int8_t)((ql[l]      >> 4)  | (((qh[l] >> 4) & 3) << 4)) - 32;
+                int8_t q4 = (int8_t)((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4)) - 32;
+
+                y[l +  0] = d * sc[is + 0] * q1;
+                y[l + 32] = d * sc[is + 2] * q2;
+                y[l + 64] = d * sc[is + 4] * q3;
+                y[l + 96] = d * sc[is + 6] * q4;
+            }
+
+            // advance to next half
+            y  += 128;
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+    }
+}
+
+// ── unified dequantize dispatcher ──
+
+bool dequantize(const void *src, float *dst, size_t n_elements, GGMLType type) {
+    switch (type) {
+        case GGML_TYPE_F32:
+            // no dequantization needed — just copy
+            __builtin_memcpy(dst, src, n_elements * sizeof(float));
+            return true;
+
+        case GGML_TYPE_Q8_0:
+            dequantize_q8_0(src, dst, n_elements);
+            return true;
+
+        case GGML_TYPE_Q4_K:
+            dequantize_q4_k(src, dst, n_elements);
+            return true;
+
+        case GGML_TYPE_Q6_K:
+            dequantize_q6_k(src, dst, n_elements);
+            return true;
+
+        default:
+            fprintf(stderr, "dequantize: unsupported type %u\n", (unsigned)type);
+            return false;
     }
 }

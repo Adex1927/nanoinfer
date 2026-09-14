@@ -16,57 +16,75 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // ── Test 1: read an F32 tensor directly (same as before) ──
+    // ── Test 1: read an F32 tensor via the unified dispatcher ──
     const char *f32_name = "blk.0.attn_norm.weight";
     TensorInfo *f32_info = get_tensor_info(model, f32_name);
-    if (f32_info && f32_info->type == 0) {
-        float *data = (float *)get_tensor_data(model, f32_name);
+    if (f32_info && f32_info->type == GGML_TYPE_F32) {
+        uint64_t n = 1;
+        for (uint32_t d = 0; d < f32_info->n_dims; d++) n *= f32_info->dims[d];
+
+        float *out = (float *)malloc(n * sizeof(float));
+        void *raw = get_tensor_data(model, f32_name);
+        dequantize(raw, out, n, f32_info->type);
+
         printf("\n--- F32 tensor: %s ---\n", f32_name);
-        printf("first 5 values (direct, no dequant needed): ");
-        for (int i = 0; i < 5; i++) printf("%.6f ", data[i]);
+        printf("first 5 values: ");
+        for (int i = 0; i < 5; i++) printf("%.6f ", out[i]);
         printf("\n");
+        free(out);
     }
 
-    // ── Test 2: dequantize a Q4_K tensor ──
-    const char *q4k_name = "blk.0.attn_q.weight";
-    TensorInfo *q4k_info = get_tensor_info(model, q4k_name);
-    if (q4k_info && q4k_info->type == 12) {  // 12 = Q4_K
-        printf("\n--- Q4_K tensor: %s ---\n", q4k_name);
+    // ── helper lambda: test any tensor through the unified dispatcher ──
+    auto test_tensor = [&](const char *name) {
+        TensorInfo *info = get_tensor_info(model, name);
+        if (!info) {
+            printf("\ntensor '%s' not found\n", name);
+            return;
+        }
+
+        printf("\n--- tensor: %s (type %u) ---\n", name, (unsigned)info->type);
         printf("dims: [");
-        for (uint32_t d = 0; d < q4k_info->n_dims; d++) {
+        for (uint32_t d = 0; d < info->n_dims; d++) {
             if (d > 0) printf(", ");
-            printf("%llu", (unsigned long long)q4k_info->dims[d]);
+            printf("%llu", (unsigned long long)info->dims[d]);
         }
         printf("]\n");
 
-        // compute total number of elements
         uint64_t n_elements = 1;
-        for (uint32_t d = 0; d < q4k_info->n_dims; d++) {
-            n_elements *= q4k_info->dims[d];
+        for (uint32_t d = 0; d < info->n_dims; d++) {
+            n_elements *= info->dims[d];
         }
 
-        // allocate output buffer and dequantize
-        float *dequantized = (float *)malloc(n_elements * sizeof(float));
-        void *raw_data = get_tensor_data(model, q4k_name);
+        float *out = (float *)malloc(n_elements * sizeof(float));
+        void *raw = get_tensor_data(model, name);
 
-        dequantize_q4_k(raw_data, dequantized, n_elements);
+        if (!dequantize(raw, out, n_elements, info->type)) {
+            printf("unsupported type, skipping\n");
+            free(out);
+            return;
+        }
 
         printf("dequantized %llu values\n", (unsigned long long)n_elements);
         printf("first 10: ");
-        for (int i = 0; i < 10; i++) printf("%.6f ", dequantized[i]);
+        for (int i = 0; i < 10 && (uint64_t)i < n_elements; i++) printf("%.6f ", out[i]);
         printf("\nlast 5:   ");
-        for (uint64_t i = n_elements - 5; i < n_elements; i++) {
-            printf("%.6f ", dequantized[i]);
+        for (uint64_t i = (n_elements > 5 ? n_elements - 5 : 0); i < n_elements; i++) {
+            printf("%.6f ", out[i]);
         }
         printf("\n");
 
-        free(dequantized);
-    } else {
-        printf("tensor '%s' not found or not Q4_K\n", q4k_name);
-    }
+        free(out);
+    };
+
+    // ── Test 2: Q4_K tensor ──
+    test_tensor("blk.0.attn_q.weight");
+
+    // ── Test 3: Q6_K tensor ──
+    test_tensor("blk.0.ffn_down.weight");
 
     free_model(model);
     printf("\nmodel freed.\n");
 
     return 0;
 }
+

@@ -29,12 +29,29 @@ enum GGUFValueType : uint32_t {
     GGUF_TYPE_FLOAT64 = 12,
 };
 
+enum GGMLType : uint32_t {
+    GGML_TYPE_F32     = 0,
+    GGML_TYPE_F16     = 1,
+    GGML_TYPE_Q4_0    = 2,
+    GGML_TYPE_Q4_1    = 3,
+    GGML_TYPE_Q5_0    = 6,
+    GGML_TYPE_Q5_1    = 7,
+    GGML_TYPE_Q8_0    = 8,
+    GGML_TYPE_Q8_1    = 9,
+    GGML_TYPE_Q2_K    = 10,
+    GGML_TYPE_Q3_K    = 11,
+    GGML_TYPE_Q4_K    = 12,
+    GGML_TYPE_Q5_K    = 13,
+    GGML_TYPE_Q6_K    = 14,
+    GGML_TYPE_Q8_K    = 15,
+};
+
 // Info about a single tensor — what we read from the tensor info table
 struct TensorInfo {
     char     *name;
     uint32_t  n_dims;
     uint64_t  dims[4];
-    uint32_t  type;       // ggml_type enum value
+    GGMLType  type;       // ggml_type enum value
     uint64_t  offset;     // relative to tensor data section start
 };
 
