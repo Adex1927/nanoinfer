@@ -1,0 +1,28 @@
+# Compiled binaries and build outputs
+model_test
+*.o
+*.obj
+*.so
+*.dylib
+*.a
+
+# Debug symbols & profiling
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Model weights (prevent accidental large file commits)
+*.gguf
+*.bin
+*.safetensors
+
+# macOS system files
+.DS_Store
+._*
+
+# Editor / IDE configuration
+.vscode/
+.idea/
+*.swp
+*~
