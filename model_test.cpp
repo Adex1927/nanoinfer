@@ -15,6 +15,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "failed to load model\n");
         return 1;
     }
+    // display all tensors with types and dimensions
+    display_model(model);
 
     // ── Test 1: read an F32 tensor via the unified dispatcher ──
     const char *f32_name = "blk.0.attn_norm.weight";

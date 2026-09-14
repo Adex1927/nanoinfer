@@ -88,4 +88,10 @@ TensorInfo *get_tensor_info(Model *model, const char *name);
 // Free everything: munmap + free tensor names + free model.
 void free_model(Model *model);
 
+// Get a human-readable string for a GGMLType (e.g. "Q4_K", "F32").
+const char *ggml_type_name(GGMLType type);
+
+// Print a summary of all tensors: name, type, and dimensions.
+void display_model(Model *model);
+
 #endif // MODEL_LOADER_H

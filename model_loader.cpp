@@ -238,3 +238,66 @@ void free_model(Model *model) {
     free(model->tensors);
     free(model);
 }
+
+// ── ggml_type_name ──
+
+const char *ggml_type_name(GGMLType type) {
+    switch (type) {
+        case GGML_TYPE_F32:  return "F32";
+        case GGML_TYPE_F16:  return "F16";
+        case GGML_TYPE_Q4_0: return "Q4_0";
+        case GGML_TYPE_Q4_1: return "Q4_1";
+        case GGML_TYPE_Q5_0: return "Q5_0";
+        case GGML_TYPE_Q5_1: return "Q5_1";
+        case GGML_TYPE_Q8_0: return "Q8_0";
+        case GGML_TYPE_Q8_1: return "Q8_1";
+        case GGML_TYPE_Q2_K: return "Q2_K";
+        case GGML_TYPE_Q3_K: return "Q3_K";
+        case GGML_TYPE_Q4_K: return "Q4_K";
+        case GGML_TYPE_Q5_K: return "Q5_K";
+        case GGML_TYPE_Q6_K: return "Q6_K";
+        case GGML_TYPE_Q8_K: return "Q8_K";
+        default:             return "???";
+    }
+}
+
+// ── display_model ──
+
+void display_model(Model *model) {
+    if (!model) {
+        printf("(null model)\n");
+        return;
+    }
+
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════════════════╗\n");
+    printf("║  Model Summary: %llu tensors, %.1f MB                              \n",
+           (unsigned long long)model->tensor_count,
+           model->file_size / (1024.0 * 1024.0));
+    printf("╠══════════════════════════════════════════════════════════════════════╣\n");
+    printf("║  %-4s  %-6s  %-20s  %-35s ║\n", "#", "Type", "Dimensions", "Name");
+    printf("╠══════════════════════════════════════════════════════════════════════╣\n");
+
+    for (uint64_t i = 0; i < model->tensor_count; i++) {
+        TensorInfo *t = &model->tensors[i];
+
+        // build dims string like "[2048, 2048]"
+        char dims_str[64];
+        int pos = 0;
+        pos += snprintf(dims_str + pos, sizeof(dims_str) - pos, "[");
+        for (uint32_t d = 0; d < t->n_dims; d++) {
+            if (d > 0) pos += snprintf(dims_str + pos, sizeof(dims_str) - pos, ", ");
+            pos += snprintf(dims_str + pos, sizeof(dims_str) - pos, "%llu",
+                           (unsigned long long)t->dims[d]);
+        }
+        snprintf(dims_str + pos, sizeof(dims_str) - pos, "]");
+
+        printf("║  %-4llu  %-6s  %-20s  %-35s ║\n",
+               (unsigned long long)i,
+               ggml_type_name(t->type),
+               dims_str,
+               t->name);
+    }
+
+    printf("╚══════════════════════════════════════════════════════════════════════╝\n");
+}
