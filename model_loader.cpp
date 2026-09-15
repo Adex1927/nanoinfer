@@ -94,33 +94,40 @@ Model *load_model(const char *path) {
     printf("tensor count:     %llu\n", (unsigned long long)model->header.tensor_count);
     printf("metadata kv count:%llu\n", (unsigned long long)model->header.metadata_kv_count);
 
-    // ── read metadata (print + skip) ──
+    // ── read metadata (store + print) ──
     printf("\n=== Metadata ===\n");
 
-    for (uint64_t i = 0; i < model->header.metadata_kv_count; i++) {
-        char *key = read_gguf_string(f, nullptr);
+    model->metadata_count = model->header.metadata_kv_count;
+    model->metadata = (MetadataKV *)calloc(model->metadata_count, sizeof(MetadataKV));
+
+    for (uint64_t i = 0; i < model->metadata_count; i++) {
+        MetadataKV *kv = &model->metadata[i];
+        kv->key = read_gguf_string(f, nullptr);
+
         uint32_t vtype;
         fread(&vtype, sizeof(vtype), 1, f);
+        kv->type = (GGUFValueType)vtype;
 
-        printf("[%3llu] %-45s ", (unsigned long long)i, key);
+        printf("[%3llu] %-45s ", (unsigned long long)i, kv->key);
 
-        switch (vtype) {
-            case GGUF_TYPE_UINT8:   { uint8_t v;  fread(&v, 1, 1, f); printf("(uint8)   %u\n", v); break; }
-            case GGUF_TYPE_INT8:    { int8_t v;   fread(&v, 1, 1, f); printf("(int8)    %d\n", v); break; }
-            case GGUF_TYPE_UINT16:  { uint16_t v; fread(&v, 2, 1, f); printf("(uint16)  %u\n", v); break; }
-            case GGUF_TYPE_INT16:   { int16_t v;  fread(&v, 2, 1, f); printf("(int16)   %d\n", v); break; }
-            case GGUF_TYPE_UINT32:  { uint32_t v; fread(&v, 4, 1, f); printf("(uint32)  %u\n", v); break; }
-            case GGUF_TYPE_INT32:   { int32_t v;  fread(&v, 4, 1, f); printf("(int32)   %d\n", v); break; }
-            case GGUF_TYPE_FLOAT32: { float v;    fread(&v, 4, 1, f); printf("(float32) %f\n", v); break; }
-            case GGUF_TYPE_BOOL:    { uint8_t v;  fread(&v, 1, 1, f); printf("(bool)    %s\n", v ? "true" : "false"); break; }
-            case GGUF_TYPE_UINT64:  { uint64_t v; fread(&v, 8, 1, f); printf("(uint64)  %llu\n", (unsigned long long)v); break; }
-            case GGUF_TYPE_INT64:   { int64_t v;  fread(&v, 8, 1, f); printf("(int64)   %lld\n", (long long)v); break; }
-            case GGUF_TYPE_FLOAT64: { double v;   fread(&v, 8, 1, f); printf("(float64) %f\n", v); break; }
+        switch (kv->type) {
+            case GGUF_TYPE_UINT8:   { uint8_t v;  fread(&v, 1, 1, f); kv->val_uint = v; printf("(uint8)   %u\n", v); break; }
+            case GGUF_TYPE_INT8:    { int8_t v;   fread(&v, 1, 1, f); kv->val_int  = v; printf("(int8)    %d\n", v); break; }
+            case GGUF_TYPE_UINT16:  { uint16_t v; fread(&v, 2, 1, f); kv->val_uint = v; printf("(uint16)  %u\n", v); break; }
+            case GGUF_TYPE_INT16:   { int16_t v;  fread(&v, 2, 1, f); kv->val_int  = v; printf("(int16)   %d\n", v); break; }
+            case GGUF_TYPE_UINT32:  { uint32_t v; fread(&v, 4, 1, f); kv->val_uint = v; printf("(uint32)  %u\n", v); break; }
+            case GGUF_TYPE_INT32:   { int32_t v;  fread(&v, 4, 1, f); kv->val_int  = v; printf("(int32)   %d\n", v); break; }
+            case GGUF_TYPE_FLOAT32: { float v;    fread(&v, 4, 1, f); kv->val_float = v; printf("(float32) %f\n", v); break; }
+            case GGUF_TYPE_BOOL:    { uint8_t v;  fread(&v, 1, 1, f); kv->val_bool = (v != 0); printf("(bool)    %s\n", v ? "true" : "false"); break; }
+            case GGUF_TYPE_UINT64:  { uint64_t v; fread(&v, 8, 1, f); kv->val_uint = v; printf("(uint64)  %llu\n", (unsigned long long)v); break; }
+            case GGUF_TYPE_INT64:   { int64_t v;  fread(&v, 8, 1, f); kv->val_int  = v; printf("(int64)   %lld\n", (long long)v); break; }
+            case GGUF_TYPE_FLOAT64: { double v;   fread(&v, 8, 1, f); kv->val_float = v; printf("(float64) %f\n", v); break; }
             case GGUF_TYPE_STRING: {
-                char *val = read_gguf_string(f, nullptr);
-                if (strlen(val) > 80) val[80] = '\0';
-                printf("(string)  \"%s\"\n", val);
-                free(val);
+                kv->val_str = read_gguf_string(f, nullptr);
+                // truncate only for display, not the stored value
+                char display[81];
+                snprintf(display, sizeof(display), "%s", kv->val_str);
+                printf("(string)  \"%s\"\n", display);
                 break;
             }
             case GGUF_TYPE_ARRAY: {
@@ -138,8 +145,6 @@ Model *load_model(const char *path) {
                 printf("(unknown type %u)\n", vtype);
                 break;
         }
-
-        free(key);
     }
 
     // ── read tensor info table ──
@@ -231,12 +236,50 @@ void free_model(Model *model) {
         munmap(model->mapped, model->file_size);
     }
 
+    // free metadata keys and string values
+    for (uint64_t i = 0; i < model->metadata_count; i++) {
+        free(model->metadata[i].key);
+        if (model->metadata[i].type == GGUF_TYPE_STRING) {
+            free(model->metadata[i].val_str);
+        }
+    }
+    free(model->metadata);
+
     // free all tensor names (we strdup'd/malloc'd them during parsing)
     for (uint64_t i = 0; i < model->tensor_count; i++) {
         free(model->tensors[i].name);
     }
     free(model->tensors);
     free(model);
+}
+
+// ── metadata accessors ──
+
+uint32_t get_metadata_u32(Model *model, const char *key, uint32_t default_val) {
+    for (uint64_t i = 0; i < model->metadata_count; i++) {
+        if (strcmp(model->metadata[i].key, key) == 0) {
+            return (uint32_t)model->metadata[i].val_uint;
+        }
+    }
+    return default_val;
+}
+
+float get_metadata_f32(Model *model, const char *key, float default_val) {
+    for (uint64_t i = 0; i < model->metadata_count; i++) {
+        if (strcmp(model->metadata[i].key, key) == 0) {
+            return (float)model->metadata[i].val_float;
+        }
+    }
+    return default_val;
+}
+
+const char *get_metadata_str(Model *model, const char *key) {
+    for (uint64_t i = 0; i < model->metadata_count; i++) {
+        if (strcmp(model->metadata[i].key, key) == 0) {
+            return model->metadata[i].val_str;
+        }
+    }
+    return nullptr;
 }
 
 // ── ggml_type_name ──

@@ -46,6 +46,19 @@ enum GGMLType : uint32_t {
     GGML_TYPE_Q8_K    = 15,
 };
 
+// Stored metadata key-value pair (scalars and strings only; arrays are skipped)
+struct MetadataKV {
+    char         *key;
+    GGUFValueType type;
+    union {
+        uint64_t val_uint;   // all unsigned integer types
+        int64_t  val_int;    // all signed integer types
+        double   val_float;  // float32 and float64
+        bool     val_bool;
+        char    *val_str;    // heap-allocated, owned by this struct
+    };
+};
+
 // Info about a single tensor — what we read from the tensor info table
 struct TensorInfo {
     char     *name;
@@ -63,6 +76,10 @@ struct Model {
 
     // parsed header
     GGUFHeader header;
+
+    // parsed metadata (scalars + strings, arrays skipped)
+    MetadataKV *metadata;
+    uint64_t    metadata_count;
 
     // tensor directory (array of tensor_count entries)
     TensorInfo *tensors;
@@ -87,6 +104,13 @@ TensorInfo *get_tensor_info(Model *model, const char *name);
 
 // Free everything: munmap + free tensor names + free model.
 void free_model(Model *model);
+
+// ── Metadata accessors ──
+// Linear search by key. Return default if not found.
+
+uint32_t get_metadata_u32(Model *model, const char *key, uint32_t default_val = 0);
+float    get_metadata_f32(Model *model, const char *key, float default_val = 0.0f);
+const char *get_metadata_str(Model *model, const char *key);
 
 // Get a human-readable string for a GGMLType (e.g. "Q4_K", "F32").
 const char *ggml_type_name(GGMLType type);
