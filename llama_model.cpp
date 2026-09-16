@@ -50,7 +50,7 @@ LlamaModel *load_llama_model(const char *path) {
 
     // infer n_vocab from token_embd shape if not in metadata
     if (hp->n_vocab == 0 && llama->token_embd) {
-        hp->n_vocab = (uint32_t)llama->token_embd->dims[0];
+        hp->n_vocab = (uint32_t)llama->token_embd->dims[1];
     }
 
     // ── map per-layer tensors ──
