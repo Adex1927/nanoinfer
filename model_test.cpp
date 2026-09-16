@@ -26,12 +26,27 @@ int main(int argc, char **argv) {
     // This is the very first thing in inference: given a token ID,
     // look up its embedding vector from the token_embd matrix.
     //
-    // token_embd is [n_embd, n_vocab] — each column is one token's embedding.
+    // token_embd is [n_embd, n_vocab] — each row is one token's embedding.
     // To get token i's embedding, we index: &embd_data[i * n_embd]
+    //
+    // IMPORTANT: token_embd is quantized (e.g. Q4_K), so we can't just
+    // cast the raw bytes to float*. We must dequantize first.
 
     int test_token = 1;  // token 1 is typically <s> (BOS)
 
-    float *embd_table = (float *)get_tensor_data(llama->model, "token_embd.weight");
+    TensorInfo *embd_info = llama->token_embd;
+    uint64_t embd_total = 1;
+    for (uint32_t d = 0; d < embd_info->n_dims; d++) {
+        embd_total *= embd_info->dims[d];
+    }
+
+    printf("\ntoken_embd type: %s, total elements: %llu\n",
+           ggml_type_name(embd_info->type), (unsigned long long)embd_total);
+
+    float *embd_table = (float *)malloc(embd_total * sizeof(float));
+    void *embd_raw = get_tensor_data(llama->model, embd_info->name);
+    dequantize(embd_raw, embd_table, embd_total, embd_info->type);
+
     float *token_vec = &embd_table[test_token * n_embd];
 
     printf("\n── Token Embedding (token %d) ──\n", test_token);
@@ -67,6 +82,7 @@ int main(int argc, char **argv) {
     printf("RMS of normalized values (should be ~1.0): %.6f\n", ss);
 
     free(normed);
+    free(embd_table);
     free_llama_model(llama);
     printf("\nmodel freed.\n");
 
