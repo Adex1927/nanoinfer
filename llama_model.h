@@ -14,6 +14,7 @@ struct LlamaHparams {
     uint32_t n_ff;            // feed-forward hidden size (5632)
     uint32_t n_ctx;           // max context length (2048)
     float    rope_freq_base;  // RoPE frequency base (10000.0)
+    float    rms_norm_eps;    // RMSNorm epsilon (typically 1e-5)
 };
 
 // ── One transformer block ──

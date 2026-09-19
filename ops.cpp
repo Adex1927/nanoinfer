@@ -47,3 +47,28 @@ void rmsnorm(float *out, const float *x, const float *weight, int n, float eps) 
         out[i] = x[i] * ss * weight[i];
     }
 }
+
+// ── Matrix-Vector Multiply ──
+//
+// The simplest possible implementation: two nested loops.
+//
+// For each output row i:
+//   out[i] = W[i][0]*x[0] + W[i][1]*x[1] + ... + W[i][n_in-1]*x[n_in-1]
+//
+// This is O(n_out × n_in). For attn_q in TinyLlama that's 2048 × 2048 = ~4M
+// multiply-adds. Naive but correct — optimization comes later.
+
+void matvec(float *out, const float *W, const float *x, int n_out, int n_in) {
+    for (int i = 0; i < n_out; i++) {
+        // start of row i in the weight matrix
+        const float *row = W + i * n_in;
+
+        // dot product of this row with input vector x
+        float sum = 0.0f;
+        for (int j = 0; j < n_in; j++) {
+            sum += row[j] * x[j];
+        }
+
+        out[i] = sum;
+    }
+}

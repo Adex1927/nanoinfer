@@ -26,6 +26,7 @@ LlamaModel *load_llama_model(const char *path) {
     hp->n_ff          = get_metadata_u32(model, "llama.feed_forward_length", 0);
     hp->n_ctx         = get_metadata_u32(model, "llama.context_length", 2048);
     hp->rope_freq_base = get_metadata_f32(model, "llama.rope.freq_base", 10000.0f);
+    hp->rms_norm_eps   = get_metadata_f32(model, "llama.attention.layer_norm_rms_epsilon", 1e-5f);
 
     // n_vocab: try metadata first, fall back to token_embd tensor shape
     hp->n_vocab = get_metadata_u32(model, "llama.vocab_size", 0);

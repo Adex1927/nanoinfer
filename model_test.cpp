@@ -62,7 +62,7 @@ int main(int argc, char **argv) {
                                                    llama->layers[0].attn_norm->name);
 
     float *normed = (float *)malloc(n_embd * sizeof(float));
-    rmsnorm(normed, token_vec, norm_weight, n_embd);
+    rmsnorm(normed, token_vec, norm_weight, n_embd, llama->hparams.rms_norm_eps);
 
     printf("\n── After RMSNorm (layer 0 attn_norm) ──\n");
     printf("first 10: ");
@@ -81,6 +81,40 @@ int main(int argc, char **argv) {
     ss = sqrtf(ss / n_embd);
     printf("RMS of normalized values (should be ~1.0): %.6f\n", ss);
 
+    // ── Step 3: Mat-vec multiply — Q projection ──
+    // After RMSNorm, the next step is to project the normalized vector
+    // into Q (query), K (key), and V (value) spaces.
+    //
+    // Q = attn_q_weight × normed
+    //
+    // attn_q weight is [n_in, n_out] = [2048, 2048] but quantized (Q4_K).
+    // We dequantize the whole thing to float, then do the multiply.
+    // (Naive but clear — we'll optimize later.)
+
+    TensorInfo *q_info = llama->layers[0].attn_q;
+    int n_in  = (int)q_info->dims[0];   // input dim  (n_embd = 2048)
+    int n_out = (int)q_info->dims[1];   // output dim (n_embd = 2048)
+    uint64_t q_total = (uint64_t)n_out * n_in;
+
+    printf("\n── Q Projection (layer 0) ──\n");
+    printf("weight: %s, shape [%d, %d], dequantizing %llu values...\n",
+           ggml_type_name(q_info->type), n_in, n_out, (unsigned long long)q_total);
+
+    // dequantize the full weight matrix
+    float *q_weight = (float *)malloc(q_total * sizeof(float));
+    void *q_raw = get_tensor_data(llama->model, q_info->name);
+    dequantize(q_raw, q_weight, q_total, q_info->type);
+
+    // multiply: q_vec = q_weight × normed
+    float *q_vec = (float *)malloc(n_out * sizeof(float));
+    matvec(q_vec, q_weight, normed, n_out, n_in);
+
+    printf("first 10 of Q: ");
+    for (int i = 0; i < 10; i++) printf("%.6f ", q_vec[i]);
+    printf("\n");
+
+    free(q_weight);
+    free(q_vec);
     free(normed);
     free(embd_table);
     free_llama_model(llama);
