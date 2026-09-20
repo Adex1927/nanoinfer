@@ -35,4 +35,50 @@ void rmsnorm(float *out, const float *x, const float *weight, int n, float eps =
 //
 void matvec(float *out, const float *W, const float *x, int n_out, int n_in);
 
+// ── Softmax ──
+// Converts a vector of raw scores into a probability distribution.
+// All output values are in (0, 1] and sum to 1.0.
+//
+// Formula:  out[i] = exp(x[i] - max(x)) / sum(exp(x[j] - max(x)))
+//
+// Why subtract max first? exp() overflows quickly for large inputs.
+// Subtracting the max keeps all exponents <= 0 (values in (0,1]),
+// which is numerically safe. The result is mathematically identical.
+//
+// In-place safe: out and x can be the same pointer.
+//
+void softmax(float *out, const float *x, int n);
+
+// ── SiLU (Sigmoid Linear Unit) ──
+// The activation function used in LLaMA's FFN (as part of SwiGLU).
+//
+// Formula:  out[i] = x[i] * sigmoid(x[i])
+//                  = x[i] / (1 + exp(-x[i]))
+//
+// Intuition: like ReLU but smooth — negative values are dampened
+// rather than hard-zeroed, which helps gradient flow during training.
+//
+// Applied element-wise. In-place safe.
+//
+void silu(float *out, const float *x, int n);
+
+// ── RoPE (Rotary Positional Embedding) ──
+// Encodes token position by rotating Q and K vectors in-place.
+//
+// Each head's dimension is split into pairs (q[0],q[1]), (q[2],q[3]), ...
+// Pair i is rotated by angle: θᵢ = pos / (freq_base ^ (2i / head_dim))
+//
+// Parameters:
+//   q              — query vector  (n_heads    * head_dim floats), modified in-place
+//   k              — key vector    (n_kv_heads * head_dim floats), modified in-place
+//   pos            — token position in the sequence (0-indexed)
+//   n_heads        — number of Q heads
+//   n_kv_heads     — number of K/V heads (may differ from n_heads for GQA)
+//   head_dim       — floats per head (n_embd / n_heads)
+//   rope_dim_count — number of dimensions to rotate per head
+//   freq_base      — RoPE frequency base (from hparams.rope_freq_base, e.g. 10000.0)
+//
+void rope(float *q, float *k, int pos, int n_heads, int n_kv_heads,
+          int head_dim, int rope_dim_count, float freq_base);
+
 #endif // OPS_H
