@@ -1,5 +1,6 @@
 #include "ops.h"
 #include <cmath>
+#include <cstring>
 
 // ── RMSNorm ──
 //
@@ -130,48 +131,31 @@ void silu(float *out, const float *x, int n) {
 void rope(float *q, float *k, int pos, int n_heads, int n_kv_heads,
           int head_dim, int rope_dim_count, float freq_base) {
 
-    // Process each head independently.
-    // Q has n_heads heads, K has n_kv_heads heads (fewer, due to GQA).
-    // Both use the same rotation angles — only the number of heads differs.
-    int n_heads_max = n_heads > n_kv_heads ? n_heads : n_kv_heads;
-
-    for (int h = 0; h < n_heads_max; h++) {
-        // pointer to the start of this head's slice
-        float *qh = q + h * head_dim;                   // always valid for h < n_heads
-        float *kh = k + h * head_dim;                   // only valid for h < n_kv_heads
-
-        // only rotate rope_dim_count dims — remaining dims stay unchanged (partial RoPE)
+    // A helper lambda to rotate one head's slice in-place.
+    // Iterates over pairs (d, d+1), computing and applying the rotation angle.
+    auto rotate_head = [&](float *h_ptr) {
         for (int d = 0; d < rope_dim_count; d += 2) {
-            int i = d / 2;  // pair index: 0, 1, 2, ... head_dim/2 - 1
+            int i = d / 2;
 
             // θᵢ = pos / (freq_base ^ (2i / head_dim))
-            //
-            // freq_base is 10000 for LLaMA. The exponent maps pair index to a
-            // frequency: pair 0 rotates fastest (large angle per step),
-            // pair head_dim/2-1 rotates slowest (tiny angle per step).
-            // This gives the model sensitivity across many positional scales.
             float theta = (float)pos / powf(freq_base, (float)(2 * i) / head_dim);
+            float cos_t = cosf(theta);
+            float sin_t = sinf(theta);
 
-            float cos_theta = cosf(theta);
-            float sin_theta = sinf(theta);
-
-            // Apply 2D rotation to the pair (q[d], q[d+1]):
-            //   [cos  -sin] [q[d]  ]
-            //   [sin   cos] [q[d+1]]
-            //
-            // We save q[d] first because we overwrite it before reading it again.
-            if (h < n_heads) {
-                float q0 = qh[d];
-                float q1 = qh[d + 1];
-                qh[d]     = q0 * cos_theta - q1 * sin_theta;
-                qh[d + 1] = q0 * sin_theta + q1 * cos_theta;
-            }
-            if (h < n_kv_heads) {
-                float k0 = kh[d];
-                float k1 = kh[d + 1];
-                kh[d]     = k0 * cos_theta - k1 * sin_theta;
-                kh[d + 1] = k0 * sin_theta + k1 * cos_theta;
-            }
+            float v0 = h_ptr[d];
+            float v1 = h_ptr[d + 1];
+            h_ptr[d]     = v0 * cos_t - v1 * sin_t;
+            h_ptr[d + 1] = v0 * sin_t + v1 * cos_t;
         }
+    };
+
+    // Rotate all Q heads (n_heads total)
+    for (int h = 0; h < n_heads; h++) {
+        rotate_head(q + h * head_dim);
+    }
+
+    // Rotate all K heads (n_kv_heads total — fewer due to GQA)
+    for (int h = 0; h < n_kv_heads; h++) {
+        rotate_head(k + h * head_dim);
     }
 }

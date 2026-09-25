@@ -14,8 +14,20 @@ float f16_to_f32(uint16_t h) {
     uint32_t result;
 
     if (exp == 0) {
-        // zero or subnormal — just treat as 0 for our purposes
-        result = sign << 31;
+        if (mant == 0) {
+            // true zero (±0)
+            result = sign << 31;
+        } else {
+            // subnormal: value = (-1)^sign × (mant / 1024) × 2^(-14)
+            // normalize: shift mantissa left until the implicit 1 bit is in place
+            exp = 113;  // 127 - 14 = 113, then we'll subtract as we shift
+            while (!(mant & 0x400)) {
+                mant <<= 1;
+                exp--;
+            }
+            mant &= 0x3FF;  // remove the implicit 1 bit
+            result = (sign << 31) | (exp << 23) | (mant << 13);
+        }
     } else if (exp == 0x1F) {
         // inf or NaN — extend to float32
         result = (sign << 31) | (0xFF << 23) | (mant << 13);

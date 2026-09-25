@@ -4,7 +4,7 @@ CXXFLAGS := -std=c++17 -Wall -Wextra -O3
 
 # Target binary name and source files
 TARGET   := model_test
-SRCS     := model_test.cpp llama_model.cpp model_loader.cpp dequant.cpp ops.cpp infer_state.cpp
+SRCS     := model_test.cpp llama_model.cpp model_loader.cpp dequant.cpp ops.cpp infer_state.cpp forward.cpp
 
 # Default rule: built when you just type `make`
 all: $(TARGET)
