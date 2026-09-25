@@ -31,9 +31,13 @@ struct InferState {
     float *v;       // [n_kv_heads * head_dim] — value projection
     float *att;     // [n_heads * n_ctx]        — attention scores (one row per head)
 
-    // ── FFN buffer ──
+    // ── FFN buffers ──
+    // SwiGLU: output = silu(gate) * up, then projected by down.
+    // gate and up are computed simultaneously from the same xb input,
+    // so both must exist at once before the element-wise multiply.
 
-    float *hb;      // [n_ff] — FFN hidden state: holds gate or gate*up before down
+    float *hb;      // [n_ff] — gate projection (after silu)
+    float *hb2;     // [n_ff] — up   projection
 
     // ── output ──
 

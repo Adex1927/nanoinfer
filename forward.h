@@ -2,6 +2,7 @@
 #define FORWARD_H
 
 #include "infer_state.h"
+#include "llama_model.h"
 
 // ── forward.h ──
 // Stateful forward operations that read/write InferState.
@@ -13,18 +14,21 @@
 // (e.g. sliding window, flash attention, cross-attention, convolution layers)
 // as the project grows.
 
-// ── Multi-Head Attention with GQA ──
-// Computes scaled dot-product attention for one token at position `pos`.
+// ── forward_layer ──
+// Runs one complete transformer layer: attention block + FFN block.
+// Reads quantized weights from llama->layers[layer], dequantizes on the fly.
+//
+// On entry:  s->x holds the residual stream for the current token.
+// On exit:   s->x holds the updated residual after this layer.
+//
+void forward_layer(LlamaModel *llama, InferState *s, int layer, int pos);
+
+// ── mha — Multi-Head Attention with GQA ──
+// Computes scaled dot-product attention for one token at position `pos`.\
 //
 // Reads:   s->q, s->k, s->v        (set by the caller before this call)
 // Writes:  s->xb                   (attention output, [n_embd])
 //          s->k_cache, s->v_cache  (current K and V stored at layer/pos slot)
-//
-// Steps per Q head h:
-//   1. Store s->k, s->v into kv_cache[layer][pos]
-//   2. score[t] = dot(q[h], k_cache[layer][t][h/group]) / sqrt(head_dim)
-//   3. softmax(score[0..pos])
-//   4. xb[h] = sum_t( score[t] * v_cache[layer][t][h/group] )
 //
 // GQA grouping: kv_head = h / (n_heads / n_kv_heads)
 //   For TinyLlama: 32 Q heads / 4 KV heads = 8 Q heads per KV group.

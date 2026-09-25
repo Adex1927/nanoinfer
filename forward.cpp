@@ -1,6 +1,20 @@
 #include "forward.h"
-#include "ops.h"   // softmax
-#include <cmath>   // sqrtf
+#include "ops.h"
+#include "dequant.h"
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+
+// Helper: dequantize a named tensor into a freshly calloc'd float buffer.
+// Caller must free() the result.
+static float *dequant(LlamaModel *llama, TensorInfo *info) {
+    uint64_t n = 1;
+    for (uint32_t d = 0; d < info->n_dims; d++) n *= info->dims[d];
+    float *buf = (float *)calloc(n, sizeof(float));
+    void  *raw = get_tensor_data(llama->model, info->name);
+    dequantize(raw, buf, n, info->type);
+    return buf;
+}
 
 // ── mha — Multi-Head Attention with Grouped Query Attention ──
 //
@@ -75,4 +89,103 @@ void mha(InferState *s, int layer, int pos) {
         }
     }
     // s->xb now holds the full attention output: [n_heads * head_dim] = [n_embd]
+}
+
+// ── forward_layer ──
+// One complete transformer block. Weights are dequantized one at a time
+// and immediately freed — we never hold more than one weight matrix in
+// float32 RAM at once, which keeps peak memory low.
+
+void forward_layer(LlamaModel *llama, InferState *s, int layer, int pos) {
+    const LlamaHparams &hp = llama->hparams;
+    const LlamaLayer   &lw = llama->layers[layer];
+
+    int n_embd  = s->n_embd;
+    int kv_dim  = s->kv_dim;
+    int n_ff    = s->n_ff;
+
+    // ── Attention block ──
+
+    // 1. Pre-attention RMSNorm: normalize s->x → s->xb using learned scale.
+    //    s->x is the residual stream; s->xb is the scratch after normalization.
+    {
+        float *w = (float *)get_tensor_data(llama->model, lw.attn_norm->name);
+        rmsnorm(s->xb, s->x, w, n_embd, hp.rms_norm_eps);
+    }
+
+    // 2. Q / K / V projections: s->xb → s->q, s->k, s->v
+    {
+        float *wq = dequant(llama, lw.attn_q);
+        matvec(s->q, wq, s->xb, n_embd, n_embd);
+        free(wq);
+
+        float *wk = dequant(llama, lw.attn_k);
+        matvec(s->k, wk, s->xb, kv_dim, n_embd);
+        free(wk);
+
+        float *wv = dequant(llama, lw.attn_v);
+        matvec(s->v, wv, s->xb, kv_dim, n_embd);
+        free(wv);
+    }
+
+    // 3. RoPE: rotate Q and K in-place to encode position.
+    //    V is left unchanged — positions are only needed for dot-product scores.
+    rope(s->q, s->k, pos,
+         s->n_heads, s->n_kv_heads, s->head_dim,
+         (int)hp.rope_dim_count, hp.rope_freq_base);
+
+    // 4. Multi-head attention: reads Q/K/V, writes result to s->xb.
+    //    Also writes current K and V into the KV cache at this layer+pos.
+    mha(s, layer, pos);
+
+    // 5. Attention output projection: s->xb → xb2, then add to residual s->x.
+    //    This projects the attention output back to n_embd dimension.
+    //    The residual add is the "skip connection" around the attention block.
+    {
+        float *wo  = dequant(llama, lw.attn_output);
+        float *xb2 = (float *)calloc(n_embd, sizeof(float));
+        matvec(xb2, wo, s->xb, n_embd, n_embd);
+        free(wo);
+
+        for (int i = 0; i < n_embd; i++) s->x[i] += xb2[i];  // residual add
+        free(xb2);
+    }
+
+    // ── FFN block (SwiGLU) ──
+
+    // 6. Pre-FFN RMSNorm: normalize updated s->x → s->xb.
+    {
+        float *w = (float *)get_tensor_data(llama->model, lw.ffn_norm->name);
+        rmsnorm(s->xb, s->x, w, n_embd, hp.rms_norm_eps);
+    }
+
+    // 7. Gate and Up projections: both read the same s->xb, produce n_ff outputs.
+    //    SwiGLU formula: FFN(x) = (silu(gate) ⊙ up) · W_down
+    {
+        float *wgate = dequant(llama, lw.ffn_gate);
+        matvec(s->hb,  wgate, s->xb, n_ff, n_embd);  // gate → hb
+        free(wgate);
+
+        float *wup   = dequant(llama, lw.ffn_up);
+        matvec(s->hb2, wup,   s->xb, n_ff, n_embd);  // up   → hb2
+        free(wup);
+    }
+
+    // 8. SwiGLU activation: apply silu to gate, then element-wise multiply by up.
+    //    silu(gate) keeps informative values, gates out uninformative ones.
+    //    Multiplying by up selects which dimensions flow through.
+    silu(s->hb, s->hb, n_ff);                          // hb  = silu(gate)
+    for (int i = 0; i < n_ff; i++) s->hb[i] *= s->hb2[i];  // hb = silu(gate) * up
+
+    // 9. Down projection: n_ff → n_embd, then residual add.
+    {
+        float *wdown = dequant(llama, lw.ffn_down);
+        float *xb2   = (float *)calloc(n_embd, sizeof(float));
+        matvec(xb2, wdown, s->hb, n_embd, n_ff);
+        free(wdown);
+
+        for (int i = 0; i < n_embd; i++) s->x[i] += xb2[i];  // residual add
+        free(xb2);
+    }
+    // s->x now holds the residual after this complete layer.
 }

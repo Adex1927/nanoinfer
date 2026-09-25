@@ -39,7 +39,8 @@ InferState *alloc_infer_state(const LlamaHparams *hp) {
 
     // ── FFN buffer ──
 
-    s->hb = (float *)calloc(s->n_ff, sizeof(float));
+    s->hb  = (float *)calloc(s->n_ff, sizeof(float));
+    s->hb2 = (float *)calloc(s->n_ff, sizeof(float));
 
     // ── output logits ──
 
@@ -61,7 +62,7 @@ InferState *alloc_infer_state(const LlamaHparams *hp) {
 
     // basic allocation check
     if (!s->x || !s->xb || !s->q || !s->k || !s->v ||
-        !s->att || !s->hb || !s->logits || !s->k_cache || !s->v_cache) {
+        !s->att || !s->hb || !s->hb2 || !s->logits || !s->k_cache || !s->v_cache) {
         fprintf(stderr, "alloc_infer_state: out of memory\n");
         free_infer_state(s);
         return nullptr;
@@ -81,6 +82,7 @@ void free_infer_state(InferState *s) {
     free(s->v);
     free(s->att);
     free(s->hb);
+    free(s->hb2);
     free(s->logits);
     free(s->k_cache);
     free(s->v_cache);
