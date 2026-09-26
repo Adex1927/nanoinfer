@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <stdio.h>
 
 // Helper: dequantize a named tensor into a freshly calloc'd float buffer.
 // Caller must free() the result.
@@ -12,7 +13,10 @@ static float *dequant(LlamaModel *llama, TensorInfo *info) {
     for (uint32_t d = 0; d < info->n_dims; d++) n *= info->dims[d];
     float *buf = (float *)calloc(n, sizeof(float));
     void  *raw = get_tensor_data(llama->model, info->name);
-    dequantize(raw, buf, n, info->type);
+    if (!dequantize(raw, buf, n, info->type)) {
+        fprintf(stdout, "ERROR: unsupported type %s (%u) for tensor %s\n",
+                ggml_type_name(info->type), (unsigned)info->type, info->name);
+    }
     return buf;
 }
 

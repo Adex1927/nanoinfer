@@ -16,7 +16,7 @@ int main(int argc, char **argv) {
     LlamaModel *llama = load_llama_model(argv[1]);
     if (!llama) return 1;
 
-    display_llama_model(llama);
+    // display_llama_model(llama);
 
     InferState *s = alloc_infer_state(&llama->hparams);
     if (!s) { free_llama_model(llama); return 1; }
@@ -46,6 +46,11 @@ int main(int argc, char **argv) {
     for (int layer = 0; layer < s->n_layers; layer++) {
         printf("  layer %d / %d ...\n", layer, s->n_layers);
         forward_layer(llama, s, layer, pos);
+        if (layer <= 1) {
+            printf("    x after layer %d: ", layer);
+            for (int i = 0; i < 5; i++) printf("%.6f ", s->x[i]);
+            printf("\n");
+        }
     }
 
     printf("x after all layers, first 5: ");
