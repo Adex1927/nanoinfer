@@ -35,4 +35,20 @@ void forward_layer(LlamaModel *llama, InferState *s, int layer, int pos);
 //
 void mha(InferState *s, int layer, int pos);
 
+// ── forward_token ──
+// Runs a full forward pass for a single token at sequence position `pos`:
+//   1. Embedding lookup: token id -> s->x
+//   2. Run through all N transformer layers (updates KV cache at `pos`)
+//   3. If need_logits is true: Final RMSNorm + output projection -> s->logits
+//
+// If need_logits is false (e.g. during prompt prefill before the last token),
+// step 3 is skipped to avoid dequantizing the giant output weight matrix.
+void forward_token(LlamaModel *llama, InferState *s, int token, int pos, bool need_logits);
+
+// ── prefill ──
+// Feeds a sequence of prompt tokens into the model to populate the KV cache.
+// Loops pos from 0 to n_tokens - 1.
+// Only computes logits on the final token (pos == n_tokens - 1).
+void prefill(LlamaModel *llama, InferState *s, const int *tokens, int n_tokens);
+
 #endif // FORWARD_H

@@ -193,3 +193,64 @@ void forward_layer(LlamaModel *llama, InferState *s, int layer, int pos) {
     }
     // s->x now holds the residual after this complete layer.
 }
+
+// ── forward_token ──
+// Runs a full forward pass for a single token at sequence position `pos`.
+void forward_token(LlamaModel *llama, InferState *s, int token, int pos, bool need_logits) {
+    // Defensive guards: prevent out-of-bounds access / buffer overflow
+    if (pos < 0 || pos >= s->n_ctx) {
+        fprintf(stderr, "ERROR: position %d exceeds context window limit %d\n", pos, s->n_ctx);
+        exit(1);
+    }
+    if (token < 0 || token >= s->n_vocab) {
+        fprintf(stderr, "ERROR: token ID %d out of vocabulary bounds [0, %d)\n", token, s->n_vocab);
+        exit(1);
+    }
+
+    int n_embd = s->n_embd;
+
+    // 1. Embedding lookup: read token embedding into residual stream s->x
+    {
+        TensorInfo *embd_info = llama->token_embd;
+        uint64_t n = 1;
+        for (uint32_t d = 0; d < embd_info->n_dims; d++) n *= embd_info->dims[d];
+        float *embd = (float *)calloc(n, sizeof(float));
+        dequantize(get_tensor_data(llama->model, embd_info->name), embd, n, embd_info->type);
+        memcpy(s->x, embd + token * n_embd, n_embd * sizeof(float));
+        free(embd);
+    }
+
+    // 2. Transformer layers (accumulates K & V into cache at position `pos`)
+    for (int layer = 0; layer < s->n_layers; layer++) {
+        forward_layer(llama, s, layer, pos);
+    }
+
+    // 3. Final RMSNorm + Output Projection (only when logits are needed)
+    if (need_logits) {
+        float *w = (float *)get_tensor_data(llama->model, llama->output_norm->name);
+        rmsnorm(s->x, s->x, w, s->n_embd, llama->hparams.rms_norm_eps);
+
+        TensorInfo *out_info = llama->output;
+        uint64_t n = 1;
+        for (uint32_t d = 0; d < out_info->n_dims; d++) n *= out_info->dims[d];
+        float *wout = (float *)calloc(n, sizeof(float));
+        dequantize(get_tensor_data(llama->model, out_info->name), wout, n, out_info->type);
+        matvec(s->logits, wout, s->x, s->n_vocab, s->n_embd);
+        free(wout);
+    }
+}
+
+// ── prefill ──
+// Feeds a sequence of prompt tokens into the model.
+// Evaluates each token, storing keys and values in the KV cache.
+// Only computes final output logits on the last token.
+void prefill(LlamaModel *llama, InferState *s, const int *tokens, int n_tokens) {
+    if (n_tokens > s->n_ctx) {
+        fprintf(stderr, "ERROR: prompt length %d exceeds context limit %d\n", n_tokens, s->n_ctx);
+        exit(1);
+    }
+    for (int pos = 0; pos < n_tokens; pos++) {
+        bool need_logits = (pos == n_tokens - 1);
+        forward_token(llama, s, tokens[pos], pos, need_logits);
+    }
+}
