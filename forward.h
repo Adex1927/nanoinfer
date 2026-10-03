@@ -3,6 +3,7 @@
 
 #include "infer_state.h"
 #include "llama_model.h"
+#include "probe.h"
 
 // ── forward.h ──
 // Stateful forward operations that read/write InferState.
@@ -21,7 +22,16 @@
 // On entry:  s->x holds the residual stream for the current token.
 // On exit:   s->x holds the updated residual after this layer.
 //
-void forward_layer(LlamaModel *llama, InferState *s, int layer, int pos);
+// pa_* — ProbeAccum buckets owned by the caller (forward_token).
+//         Each stage appends one sample; the caller prints the summary.
+//
+void forward_layer(LlamaModel *llama, InferState *s, int layer, int pos,
+                   ProbeAccum *pa_norm,
+                   ProbeAccum *pa_qkv,
+                   ProbeAccum *pa_rope,
+                   ProbeAccum *pa_mha,
+                   ProbeAccum *pa_out_proj,
+                   ProbeAccum *pa_ffn);
 
 // ── mha — Multi-Head Attention with GQA ──
 // Computes scaled dot-product attention for one token at position `pos`.\

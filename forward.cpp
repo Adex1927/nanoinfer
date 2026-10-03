@@ -1,6 +1,7 @@
 #include "forward.h"
 #include "ops.h"
 #include "dequant.h"
+#include "probe.h"
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -100,7 +101,13 @@ void mha(InferState *s, int layer, int pos) {
 // and immediately freed — we never hold more than one weight matrix in
 // float32 RAM at once, which keeps peak memory low.
 
-void forward_layer(LlamaModel *llama, InferState *s, int layer, int pos) {
+void forward_layer(LlamaModel *llama, InferState *s, int layer, int pos,
+                   ProbeAccum *pa_norm,
+                   ProbeAccum *pa_qkv,
+                   ProbeAccum *pa_rope,
+                   ProbeAccum *pa_mha,
+                   ProbeAccum *pa_out_proj,
+                   ProbeAccum *pa_ffn) {
     const LlamaHparams &hp = llama->hparams;
     const LlamaLayer   &lw = llama->layers[layer];
 
@@ -113,12 +120,15 @@ void forward_layer(LlamaModel *llama, InferState *s, int layer, int pos) {
     // 1. Pre-attention RMSNorm: normalize s->x → s->xb using learned scale.
     //    s->x is the residual stream; s->xb is the scratch after normalization.
     {
+        auto t = pa_norm->start();
         float *w = (float *)get_tensor_data(llama->model, lw.attn_norm->name);
         rmsnorm(s->xb, s->x, w, n_embd, hp.rms_norm_eps);
+        pa_norm->stop(t);
     }
 
     // 2. Q / K / V projections: s->xb → s->q, s->k, s->v
     {
+        auto t = pa_qkv->start();
         float *wq = dequant(llama, lw.attn_q);
         matvec(s->q, wq, s->xb, n_embd, n_embd);
         free(wq);
@@ -130,22 +140,32 @@ void forward_layer(LlamaModel *llama, InferState *s, int layer, int pos) {
         float *wv = dequant(llama, lw.attn_v);
         matvec(s->v, wv, s->xb, kv_dim, n_embd);
         free(wv);
+        pa_qkv->stop(t);
     }
 
     // 3. RoPE: rotate Q and K in-place to encode position.
     //    V is left unchanged — positions are only needed for dot-product scores.
-    rope(s->q, s->k, pos,
-         s->n_heads, s->n_kv_heads, s->head_dim,
-         (int)hp.rope_dim_count, hp.rope_freq_base);
+    {
+        auto t = pa_rope->start();
+        rope(s->q, s->k, pos,
+             s->n_heads, s->n_kv_heads, s->head_dim,
+             (int)hp.rope_dim_count, hp.rope_freq_base);
+        pa_rope->stop(t);
+    }
 
     // 4. Multi-head attention: reads Q/K/V, writes result to s->xb.
     //    Also writes current K and V into the KV cache at this layer+pos.
-    mha(s, layer, pos);
+    {
+        auto t = pa_mha->start();
+        mha(s, layer, pos);
+        pa_mha->stop(t);
+    }
 
     // 5. Attention output projection: s->xb → xb2, then add to residual s->x.
     //    This projects the attention output back to n_embd dimension.
     //    The residual add is the "skip connection" around the attention block.
     {
+        auto t = pa_out_proj->start();
         float *wo  = dequant(llama, lw.attn_output);
         float *xb2 = (float *)calloc(n_embd, sizeof(float));
         matvec(xb2, wo, s->xb, n_embd, n_embd);
@@ -153,43 +173,47 @@ void forward_layer(LlamaModel *llama, InferState *s, int layer, int pos) {
 
         for (int i = 0; i < n_embd; i++) s->x[i] += xb2[i];  // residual add
         free(xb2);
+        pa_out_proj->stop(t);
     }
 
     // ── FFN block (SwiGLU) ──
-
-    // 6. Pre-FFN RMSNorm: normalize updated s->x → s->xb.
     {
-        float *w = (float *)get_tensor_data(llama->model, lw.ffn_norm->name);
-        rmsnorm(s->xb, s->x, w, n_embd, hp.rms_norm_eps);
-    }
+        auto t = pa_ffn->start();
 
-    // 7. Gate and Up projections: both read the same s->xb, produce n_ff outputs.
-    //    SwiGLU formula: FFN(x) = (silu(gate) ⊙ up) · W_down
-    {
-        float *wgate = dequant(llama, lw.ffn_gate);
-        matvec(s->hb,  wgate, s->xb, n_ff, n_embd);  // gate → hb
-        free(wgate);
+        // 6. Pre-FFN RMSNorm: normalize updated s->x → s->xb.
+        {
+            float *w = (float *)get_tensor_data(llama->model, lw.ffn_norm->name);
+            rmsnorm(s->xb, s->x, w, n_embd, hp.rms_norm_eps);
+        }
 
-        float *wup   = dequant(llama, lw.ffn_up);
-        matvec(s->hb2, wup,   s->xb, n_ff, n_embd);  // up   → hb2
-        free(wup);
-    }
+        // 7. Gate and Up projections: both read the same s->xb, produce n_ff outputs.
+        //    SwiGLU formula: FFN(x) = (silu(gate) ⊙ up) · W_down
+        {
+            float *wgate = dequant(llama, lw.ffn_gate);
+            matvec(s->hb,  wgate, s->xb, n_ff, n_embd);  // gate → hb
+            free(wgate);
 
-    // 8. SwiGLU activation: apply silu to gate, then element-wise multiply by up.
-    //    silu(gate) keeps informative values, gates out uninformative ones.
-    //    Multiplying by up selects which dimensions flow through.
-    silu(s->hb, s->hb, n_ff);                          // hb  = silu(gate)
-    for (int i = 0; i < n_ff; i++) s->hb[i] *= s->hb2[i];  // hb = silu(gate) * up
+            float *wup   = dequant(llama, lw.ffn_up);
+            matvec(s->hb2, wup,   s->xb, n_ff, n_embd);  // up   → hb2
+            free(wup);
+        }
 
-    // 9. Down projection: n_ff → n_embd, then residual add.
-    {
-        float *wdown = dequant(llama, lw.ffn_down);
-        float *xb2   = (float *)calloc(n_embd, sizeof(float));
-        matvec(xb2, wdown, s->hb, n_embd, n_ff);
-        free(wdown);
+        // 8. SwiGLU activation: apply silu to gate, then element-wise multiply by up.
+        silu(s->hb, s->hb, n_ff);                          // hb  = silu(gate)
+        for (int i = 0; i < n_ff; i++) s->hb[i] *= s->hb2[i];  // hb = silu(gate) * up
 
-        for (int i = 0; i < n_embd; i++) s->x[i] += xb2[i];  // residual add
-        free(xb2);
+        // 9. Down projection: n_ff → n_embd, then residual add.
+        {
+            float *wdown = dequant(llama, lw.ffn_down);
+            float *xb2   = (float *)calloc(n_embd, sizeof(float));
+            matvec(xb2, wdown, s->hb, n_embd, n_ff);
+            free(wdown);
+
+            for (int i = 0; i < n_embd; i++) s->x[i] += xb2[i];  // residual add
+            free(xb2);
+        }
+
+        pa_ffn->stop(t);
     }
     // s->x now holds the residual after this complete layer.
 }
@@ -211,6 +235,7 @@ void forward_token(LlamaModel *llama, InferState *s, int token, int pos, bool ne
 
     // 1. Embedding lookup: read token embedding into residual stream s->x
     {
+        Probe p("embedding_lookup");
         TensorInfo *embd_info = llama->token_embd;
         uint64_t n = 1;
         for (uint32_t d = 0; d < embd_info->n_dims; d++) n *= embd_info->dims[d];
@@ -221,12 +246,37 @@ void forward_token(LlamaModel *llama, InferState *s, int token, int pos, bool ne
     }
 
     // 2. Transformer layers (accumulates K & V into cache at position `pos`)
-    for (int layer = 0; layer < s->n_layers; layer++) {
-        forward_layer(llama, s, layer, pos);
+    //
+    // ProbeAccum collects one sample per layer, then reports a single summary
+    // line (total / avg / min / max) after the loop — avoids log spam.
+    {
+        ProbeAccum pa_norm    ("  layer:attn_norm");
+        ProbeAccum pa_qkv     ("  layer:qkv_proj");
+        ProbeAccum pa_rope    ("  layer:rope");
+        ProbeAccum pa_mha     ("  layer:mha");
+        ProbeAccum pa_out_proj("  layer:attn_out_proj");
+        ProbeAccum pa_ffn     ("  layer:ffn");
+
+        Probe p_layers("all_layers");
+        for (int layer = 0; layer < s->n_layers; layer++) {
+            forward_layer(llama, s, layer, pos,
+                          &pa_norm, &pa_qkv, &pa_rope,
+                          &pa_mha, &pa_out_proj, &pa_ffn);
+        }
+        // p_layers destructor fires here → prints total time for all layers
+        // then the ProbeAccum reports print per-stage breakdowns
+
+        pa_norm.report();
+        pa_qkv.report();
+        pa_rope.report();
+        pa_mha.report();
+        pa_out_proj.report();
+        pa_ffn.report();
     }
 
     // 3. Final RMSNorm + Output Projection (only when logits are needed)
     if (need_logits) {
+        Probe p("final_norm_and_lm_head");
         float *w = (float *)get_tensor_data(llama->model, llama->output_norm->name);
         rmsnorm(s->x, s->x, w, s->n_embd, llama->hparams.rms_norm_eps);
 
@@ -249,8 +299,12 @@ void prefill(LlamaModel *llama, InferState *s, const int *tokens, int n_tokens) 
         fprintf(stderr, "ERROR: prompt length %d exceeds context limit %d\n", n_tokens, s->n_ctx);
         exit(1);
     }
+
+    Probe p_prefill("prefill_total");
     for (int pos = 0; pos < n_tokens; pos++) {
+        fprintf(stderr, "\n[PROBE] ── token pos=%d ──\n", pos);
         bool need_logits = (pos == n_tokens - 1);
         forward_token(llama, s, tokens[pos], pos, need_logits);
     }
+    // p_prefill destructor fires here → prints total prefill wall time
 }

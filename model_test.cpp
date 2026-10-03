@@ -1,8 +1,7 @@
 #include "llama_model.h"
 #include "infer_state.h"
-#include "dequant.h"
-#include "ops.h"
 #include "forward.h"
+#include "probe.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -43,13 +42,19 @@ int main(int argc, char **argv) {
     // ── Prefill: feed all prompt tokens through the model ──
     // Each token is forwarded into the KV cache at position pos = 0, 1, ...
     // Logits are only computed on the final prompt token.
-    prefill(llama, s, prompt.data(), (int)prompt.size());
+    {
+        Probe p("prefill");
+        prefill(llama, s, prompt.data(), (int)prompt.size());
+    }
 
     // ── Argmax: find the highest-scoring next token ──
     int best_token = 0;
-    for (int i = 1; i < s->n_vocab; i++) {
-        if (s->logits[i] > s->logits[best_token]) {
-            best_token = i;
+    {
+        Probe p("argmax");
+        for (int i = 1; i < s->n_vocab; i++) {
+            if (s->logits[i] > s->logits[best_token]) {
+                best_token = i;
+            }
         }
     }
 
