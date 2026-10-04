@@ -136,8 +136,21 @@ Model *load_model(const char *path) {
                 fread(&elem_type, sizeof(elem_type), 1, f);
                 fread(&count, sizeof(count), 1, f);
                 printf("(array)   %llu elements of type %u\n", (unsigned long long)count, elem_type);
-                for (uint64_t j = 0; j < count; j++) {
-                    skip_value(f, elem_type);
+
+                if (strcmp(kv->key, "tokenizer.ggml.tokens") == 0 && elem_type == GGUF_TYPE_STRING) {
+                    // keep the vocab: detokenizer needs it
+                    model->vocab = (char **)calloc(count, sizeof(char *));
+                    model->vocab_size = count;
+                    for (uint64_t j = 0; j < count; j++) {
+                        model->vocab[j] = read_gguf_string(f, nullptr);
+                    }
+                } else if (strcmp(kv->key, "tokenizer.ggml.token_type") == 0 && elem_type == GGUF_TYPE_INT32) {
+                    model->token_types = (int32_t *)malloc(count * sizeof(int32_t));
+                    fread(model->token_types, sizeof(int32_t), count, f);
+                } else {
+                    for (uint64_t j = 0; j < count; j++) {
+                        skip_value(f, elem_type);
+                    }
                 }
                 break;
             }
@@ -244,6 +257,11 @@ void free_model(Model *model) {
         }
     }
     free(model->metadata);
+
+    // free vocab
+    for (uint64_t i = 0; i < model->vocab_size; i++) free(model->vocab[i]);
+    free(model->vocab);
+    free(model->token_types);
 
     // free all tensor names (we strdup'd/malloc'd them during parsing)
     for (uint64_t i = 0; i < model->tensor_count; i++) {

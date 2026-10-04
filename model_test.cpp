@@ -2,6 +2,7 @@
 #include "infer_state.h"
 #include "forward.h"
 #include "probe.h"
+#include "tokenizer.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -39,17 +40,29 @@ int main(int argc, char **argv) {
     }
     printf("\n");
 
-    // ── Generation: greedy decode, streaming token IDs ──
-    // Usage: ./model_test model.gguf [token ids...] [-n N]  (N via env NANO_N, default 20)
-    const int eos_id = 2;  // </s> for TinyLlama (tokenizer.ggml.eos_token_id)
-    int max_new = getenv("NANO_N") ? atoi(getenv("NANO_N")) : 20;
+    printf("Prompt text: \"%s\"\n", detokenize(llama->model, prompt.data(), (int)prompt.size()).c_str());
 
-    printf("Generated token IDs:");
+    // ── Generation: greedy decode, streaming text ──
+    // N via env NANO_N (default 20)
+    const int eos_id = 2;  // </s> for TinyLlama (tokenizer.ggml.eos_token_id)
+    int max_new = getenv("NANO_N") ? atoi(getenv("NANO_N")) : 50;
+
+    struct Out { Model *model; std::vector<int> ids; } out = { llama->model, {} };
+
+    printf("Generated text: ");
     fflush(stdout);
     int n_gen = generate(llama, s, prompt.data(), (int)prompt.size(), max_new, eos_id,
-                         [](int tok, void *) { printf(" %d", tok); fflush(stdout); },
-                         nullptr);
-    printf("\n(%d tokens)\n", n_gen);
+                         [](int tok, void *user) {
+                             Out *o = (Out *)user;
+                             o->ids.push_back(tok);
+                             std::string piece = token_to_piece(o->model, tok);
+                             fwrite(piece.data(), 1, piece.size(), stdout);
+                             fflush(stdout);
+                         },
+                         &out);
+    printf("\n(%d tokens)\nGenerated token IDs:", n_gen);
+    for (int id : out.ids) printf(" %d", id);
+    printf("\n");
 
     free_infer_state(s);
     free_llama_model(llama);

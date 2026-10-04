@@ -32,7 +32,7 @@
 //   probes with zero overhead. Default is enabled.
 
 #ifndef PROBE_ENABLED
-#define PROBE_ENABLED 1
+#define PROBE_ENABLED 0
 #endif
 
 #include <chrono>

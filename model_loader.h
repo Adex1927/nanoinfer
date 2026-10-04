@@ -87,6 +87,13 @@ struct Model {
 
     // where tensor data starts in the file
     uint64_t tensor_data_start;
+
+    // ── tokenizer vocabulary (from tokenizer.ggml.tokens / token_type) ──
+    // Other metadata arrays are still skipped. nullptr / 0 if absent.
+    char    **vocab;            // vocab[id] = token string (heap-allocated, owned)
+    uint64_t  vocab_size;
+    int32_t  *token_types;      // token_types[id]: 1=normal 2=unknown 3=control
+                                //   4=user-defined 5=unused 6=byte
 };
 
 // ── API ──
