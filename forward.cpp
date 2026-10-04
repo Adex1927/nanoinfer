@@ -308,3 +308,41 @@ void prefill(LlamaModel *llama, InferState *s, const int *tokens, int n_tokens) 
     }
     // p_prefill destructor fires here → prints total prefill wall time
 }
+
+// ── argmax_token ──
+int argmax_token(const InferState *s) {
+    int best = 0;
+    for (int i = 1; i < s->n_vocab; i++) {
+        if (s->logits[i] > s->logits[best]) best = i;
+    }
+    return best;
+}
+
+// ── generate ──
+// After prefill, s->logits holds the distribution for the token that follows
+// the prompt. Each iteration: sample it, then forward it at the next position
+// (which also appends its K/V to the cache) to get logits for the one after.
+int generate(LlamaModel *llama, InferState *s,
+             const int *prompt, int n_prompt,
+             int max_new, int eos_id,
+             TokenCallback on_token, void *user) {
+    {
+        Probe p("prefill");
+        prefill(llama, s, prompt, n_prompt);
+    }
+
+    int pos = n_prompt;  // position the next generated token will occupy
+    int n_generated = 0;
+    while (n_generated < max_new) {
+        int next = argmax_token(s);
+        if (next == eos_id) break;
+
+        if (on_token) on_token(next, user);
+        n_generated++;
+
+        if (pos >= s->n_ctx) break;  // context window full
+        forward_token(llama, s, next, pos, true);
+        pos++;
+    }
+    return n_generated;
+}

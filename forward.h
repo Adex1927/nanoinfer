@@ -61,4 +61,22 @@ void forward_token(LlamaModel *llama, InferState *s, int token, int pos, bool ne
 // Only computes logits on the final token (pos == n_tokens - 1).
 void prefill(LlamaModel *llama, InferState *s, const int *tokens, int n_tokens);
 
+// ── argmax_token ──
+// Returns the index of the highest value in s->logits (greedy sampling).
+int argmax_token(const InferState *s);
+
+// ── generate ──
+// Greedy autoregressive generation:
+//   1. prefill(prompt)                -> logits for the first new token
+//   2. loop: pick argmax, emit it, feed it back at the next pos, repeat
+// Stops when max_new tokens were produced, EOS is sampled, or the context is full.
+//
+// on_token (optional) is called for every generated token (EOS excluded),
+// which lets the caller stream output. Returns the number of tokens generated.
+typedef void (*TokenCallback)(int token, void *user);
+int generate(LlamaModel *llama, InferState *s,
+             const int *prompt, int n_prompt,
+             int max_new, int eos_id,
+             TokenCallback on_token, void *user);
+
 #endif // FORWARD_H

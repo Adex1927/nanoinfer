@@ -39,41 +39,17 @@ int main(int argc, char **argv) {
     }
     printf("\n");
 
-    // ── Prefill: feed all prompt tokens through the model ──
-    // Each token is forwarded into the KV cache at position pos = 0, 1, ...
-    // Logits are only computed on the final prompt token.
-    {
-        Probe p("prefill");
-        prefill(llama, s, prompt.data(), (int)prompt.size());
-    }
+    // ── Generation: greedy decode, streaming token IDs ──
+    // Usage: ./model_test model.gguf [token ids...] [-n N]  (N via env NANO_N, default 20)
+    const int eos_id = 2;  // </s> for TinyLlama (tokenizer.ggml.eos_token_id)
+    int max_new = getenv("NANO_N") ? atoi(getenv("NANO_N")) : 20;
 
-    // ── Argmax: find the highest-scoring next token ──
-    int best_token = 0;
-    {
-        Probe p("argmax");
-        for (int i = 1; i < s->n_vocab; i++) {
-            if (s->logits[i] > s->logits[best_token]) {
-                best_token = i;
-            }
-        }
-    }
-
-    printf("\n════════════════════════════════════════\n");
-    printf("  Last prompt token:  %d (at pos %zu)\n", prompt.back(), prompt.size() - 1);
-    printf("  Predicted next:     %d\n", best_token);
-    printf("  Logit score:        %.4f\n", s->logits[best_token]);
-    printf("════════════════════════════════════════\n");
-
-    // ── Top 10 logits ──
-    printf("\nTop 10 tokens by logit score:\n");
-    for (int rank = 0; rank < 10; rank++) {
-        int top = 0;
-        for (int i = 1; i < s->n_vocab; i++) {
-            if (s->logits[i] > s->logits[top]) top = i;
-        }
-        printf("  #%-2d token=%5d  logit=%.4f\n", rank + 1, top, s->logits[top]);
-        s->logits[top] = -1e30f;  // mask it out for next iteration
-    }
+    printf("Generated token IDs:");
+    fflush(stdout);
+    int n_gen = generate(llama, s, prompt.data(), (int)prompt.size(), max_new, eos_id,
+                         [](int tok, void *) { printf(" %d", tok); fflush(stdout); },
+                         nullptr);
+    printf("\n(%d tokens)\n", n_gen);
 
     free_infer_state(s);
     free_llama_model(llama);
