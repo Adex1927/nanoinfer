@@ -11,6 +11,9 @@ model_test
 *.su
 *.idb
 *.pdb
+*.csv
+*.png
+*.pdf
 
 # Model weights (prevent accidental large file commits)
 *.gguf
