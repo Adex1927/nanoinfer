@@ -4,10 +4,11 @@ Plot the probe data written by nanoinfer (probe.csv).
 
 CSV columns: name,phase,token_pos,layer,ms
 
-Prints a text table and saves one figure with three plain panels:
+Prints a text table and saves one figure with four plain panels:
   1. decode step latency vs token position   (trend / outliers)
   2. share of a decode step by stage         (what to optimize)
   3. mean time per layer, per stage          (are any layers odd?)
+  4. attention time vs context length        (O(pos) growth of mha)
 
 Usage:
   python3 tools/plot_probe.py                    # reads probe.csv -> probe.png
@@ -16,6 +17,7 @@ Usage:
 """
 import argparse
 
+import numpy as np
 import pandas as pd
 
 # Stages that make up one token's work. Aggregates (all_layers,
@@ -62,7 +64,8 @@ def main():
 
     print_table(df)
 
-    fig, ax = plt.subplots(1, 3, figsize=(16, 4.5))
+    fig, axs = plt.subplots(2, 2, figsize=(13, 9))
+    ax = axs.ravel()
 
     # 1. decode step latency vs token position
     step = dec[dec.name == "decode:forward_token"].sort_values("token_pos")
@@ -98,6 +101,19 @@ def main():
     ax[2].set_xlabel("layer")
     ax[2].set_ylabel("ms")
     ax[2].legend(fontsize=7)
+
+    # 4. attention time vs context length (mean over layers, per token position)
+    mha = dec[dec.name == "layer:mha"].groupby("token_pos").ms.mean() * 1000  # us
+    if len(mha) > 1:
+        ax[3].plot(mha.index, mha.values, marker=".", lw=1, label="measured")
+        slope, icpt = np.polyfit(mha.index, mha.values, 1)
+        ax[3].plot(mha.index, slope * mha.index + icpt, "--", color="gray",
+                   label=f"fit: {slope:.2f} us/token")
+        ax[3].legend()
+    ax[3].set_title("Attention (mha) time vs context length")
+    ax[3].set_xlabel("token position (context length - 1)")
+    ax[3].set_ylabel("us per layer call")
+    ax[3].set_ylim(bottom=0)
 
     fig.tight_layout()
     fig.savefig(args.out, dpi=120)
