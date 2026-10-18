@@ -64,6 +64,9 @@ int main(int argc, char **argv) {
     for (int id : out.ids) printf(" %d", id);
     printf("\n");
 
+    probe_print_summary();
+    probe_dump_csv(getenv("NANO_PROBE_CSV") ? getenv("NANO_PROBE_CSV") : "probe.csv");
+
     free_infer_state(s);
     free_llama_model(llama);
     return 0;

@@ -110,6 +110,7 @@ void forward_layer(LlamaModel *llama, InferState *s, int layer, int pos,
                    ProbeAccum *pa_ffn) {
     const LlamaHparams &hp = llama->hparams;
     const LlamaLayer   &lw = llama->layers[layer];
+    probe_set_layer(layer);
 
     int n_embd  = s->n_embd;
     int kv_dim  = s->kv_dim;
@@ -232,6 +233,7 @@ void forward_token(LlamaModel *llama, InferState *s, int token, int pos, bool ne
     }
 
     int n_embd = s->n_embd;
+    probe_set_pos(pos);
 
     // 1. Embedding lookup: read token embedding into residual stream s->x
     {
@@ -250,12 +252,12 @@ void forward_token(LlamaModel *llama, InferState *s, int token, int pos, bool ne
     // ProbeAccum collects one sample per layer, then reports a single summary
     // line (total / avg / min / max) after the loop — avoids log spam.
     {
-        ProbeAccum pa_norm    ("  layer:attn_norm");
-        ProbeAccum pa_qkv     ("  layer:qkv_proj");
-        ProbeAccum pa_rope    ("  layer:rope");
-        ProbeAccum pa_mha     ("  layer:mha");
-        ProbeAccum pa_out_proj("  layer:attn_out_proj");
-        ProbeAccum pa_ffn     ("  layer:ffn");
+        ProbeAccum pa_norm    ("layer:attn_norm");
+        ProbeAccum pa_qkv     ("layer:qkv_proj");
+        ProbeAccum pa_rope    ("layer:rope");
+        ProbeAccum pa_mha     ("layer:mha");
+        ProbeAccum pa_out_proj("layer:attn_out_proj");
+        ProbeAccum pa_ffn     ("layer:ffn");
 
         Probe p_layers("all_layers");
         for (int layer = 0; layer < s->n_layers; layer++) {
@@ -263,6 +265,8 @@ void forward_token(LlamaModel *llama, InferState *s, int token, int pos, bool ne
                           &pa_norm, &pa_qkv, &pa_rope,
                           &pa_mha, &pa_out_proj, &pa_ffn);
         }
+        probe_set_layer(-1);
+        // samples are stored in the probe table; dump with probe_dump_csv()
         // p_layers destructor fires here → prints total time for all layers
         // then the ProbeAccum reports print per-stage breakdowns
 
@@ -300,9 +304,9 @@ void prefill(LlamaModel *llama, InferState *s, const int *tokens, int n_tokens) 
         exit(1);
     }
 
+    probe_set_pos(-1);
     Probe p_prefill("prefill_total");
     for (int pos = 0; pos < n_tokens; pos++) {
-        fprintf(stderr, "\n[PROBE] ── token pos=%d ──\n", pos);
         bool need_logits = (pos == n_tokens - 1);
         forward_token(llama, s, tokens[pos], pos, need_logits);
     }
@@ -327,22 +331,43 @@ int generate(LlamaModel *llama, InferState *s,
              int max_new, int eos_id,
              TokenCallback on_token, void *user) {
     {
+        probe_set_phase("prefill");
+        probe_set_pos(-1);
         Probe p("prefill");
         prefill(llama, s, prompt, n_prompt);
     }
 
     int pos = n_prompt;  // position the next generated token will occupy
     int n_generated = 0;
+
+    // One sample per generated token, stored with its token position.
+    probe_set_phase("decode");
+    ProbeAccum pa_argmax ("decode:argmax");
+    ProbeAccum pa_forward("decode:forward_token");
+
     while (n_generated < max_new) {
-        int next = argmax_token(s);
+        probe_set_pos(pos);
+        int next;
+        {
+            auto t = pa_argmax.start();
+            next = argmax_token(s);
+            pa_argmax.stop(t);
+        }
         if (next == eos_id) break;
 
         if (on_token) on_token(next, user);
         n_generated++;
 
         if (pos >= s->n_ctx) break;  // context window full
-        forward_token(llama, s, next, pos, true);
+        {
+            auto t = pa_forward.start();
+            forward_token(llama, s, next, pos, true);
+            pa_forward.stop(t);
+        }
         pos++;
     }
+
+    probe_set_pos(-1);
+    probe_set_phase("");
     return n_generated;
 }
