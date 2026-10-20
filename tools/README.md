@@ -17,4 +17,10 @@ python3 tools/compare_greedy.py -m ../llama.cpp/models/tinyllama.gguf -p "The ca
 
 # Run and compare side-by-side with nanoinfer:
 python3 tools/compare_greedy.py -m ../llama.cpp/models/tinyllama.gguf -p "World" -n 20 --compare
+
+# Run correctness test suite against llama.cpp (tokenizer exact matches + logits verification):
+python3 tools/test_nanoinfer.py -m ../llama.cpp/models/tinyllama.gguf
+
+# Fast test (tokenizer tests only, skips model forward passes):
+python3 tools/test_nanoinfer.py -m ../llama.cpp/models/tinyllama.gguf --tokenizer-only
 ```
