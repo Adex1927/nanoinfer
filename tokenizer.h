@@ -3,6 +3,18 @@
 
 #include "model_loader.h"
 #include <string>
+#include <vector>
+
+// ── tokenize ──
+// Text -> token IDs for SentencePiece-style ("llama") vocabularies:
+//   1. spaces become "▁" (U+2581) and one is prepended (add_space_prefix)
+//   2. the text is split into UTF-8 characters
+//   3. repeatedly merge the adjacent pair whose concatenation is a vocab token
+//      with the highest score (ties: leftmost) until no merge is possible
+//   4. any piece still not in the vocab falls back to byte tokens "<0xXX>"
+//   5. BOS (tokenizer.ggml.bos_token_id, 1 for llama) is prepended if add_bos
+// Returns an empty vector if the model has no vocab.
+std::vector<int> tokenize(const Model *model, const std::string &text, bool add_bos = true);
 
 // ── tokenizer.h ──
 // Text <-> token ID conversion for SentencePiece-style ("llama") vocabularies.

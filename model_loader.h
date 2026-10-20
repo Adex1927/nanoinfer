@@ -94,6 +94,7 @@ struct Model {
     uint64_t  vocab_size;
     int32_t  *token_types;      // token_types[id]: 1=normal 2=unknown 3=control
                                 //   4=user-defined 5=unused 6=byte
+    float    *token_scores;     // token_scores[id]: SentencePiece merge priority (higher merges first)
 };
 
 // ── API ──

@@ -147,6 +147,9 @@ Model *load_model(const char *path) {
                 } else if (strcmp(kv->key, "tokenizer.ggml.token_type") == 0 && elem_type == GGUF_TYPE_INT32) {
                     model->token_types = (int32_t *)malloc(count * sizeof(int32_t));
                     fread(model->token_types, sizeof(int32_t), count, f);
+                } else if (strcmp(kv->key, "tokenizer.ggml.scores") == 0 && elem_type == GGUF_TYPE_FLOAT32) {
+                    model->token_scores = (float *)malloc(count * sizeof(float));
+                    fread(model->token_scores, sizeof(float), count, f);
                 } else {
                     for (uint64_t j = 0; j < count; j++) {
                         skip_value(f, elem_type);
@@ -262,6 +265,7 @@ void free_model(Model *model) {
     for (uint64_t i = 0; i < model->vocab_size; i++) free(model->vocab[i]);
     free(model->vocab);
     free(model->token_types);
+    free(model->token_scores);
 
     // free all tensor names (we strdup'd/malloc'd them during parsing)
     for (uint64_t i = 0; i < model->tensor_count; i++) {
