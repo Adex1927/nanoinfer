@@ -1,5 +1,6 @@
 # Compiled binaries and build outputs
 model_test
+test_ops
 *.o
 *.obj
 *.so

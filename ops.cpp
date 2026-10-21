@@ -1,4 +1,5 @@
 #include "ops.h"
+#include "dequant.h"
 #include <cmath>
 #include <cstring>
 
@@ -71,6 +72,35 @@ void matvec(float *out, const float *W, const float *x, int n_out, int n_in) {
         }
 
         out[i] = sum;
+    }
+}
+
+// ── Fused Quantized Matrix-Vector Multiply (Q8_0) ──
+//
+// Fuses dequantization and dot-product directly in registers:
+// For each block of 32 weights:
+//   dot_block = scale * sum(quant[j] * x[j])
+// Eliminates the need to allocate or write full float weight matrices to RAM.
+void matvec_q8_0(float *out, const void *W, const float *x, int n_out, int n_in) {
+    const BlockQ8_0 *blocks = (const BlockQ8_0 *)W;
+    int blocks_per_row = n_in / 32;
+
+    for (int i = 0; i < n_out; i++) {
+        const BlockQ8_0 *row = blocks + i * blocks_per_row;
+        float row_sum = 0.0f;
+
+        for (int b = 0; b < blocks_per_row; b++) {
+            const float *x_block = x + b * 32;
+            float block_sum = 0.0f;
+
+            for (int j = 0; j < 32; j++) {
+                block_sum += (float)row[b].quants[j] * x_block[j];
+            }
+
+            row_sum += f16_to_f32(row[b].scale) * block_sum;
+        }
+
+        out[i] = row_sum;
     }
 }
 

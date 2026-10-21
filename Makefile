@@ -13,9 +13,13 @@ all: $(TARGET)
 $(TARGET): $(SRCS)
 	$(CXX) $(CXXFLAGS) -o $(TARGET) $(SRCS)
 
+# Unit tests
+test_ops: tests/test_ops.cpp ops.cpp dequant.cpp
+	$(CXX) $(CXXFLAGS) -I. -o $@ $^
+
 # Cleanup build artifacts
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) test_ops
 
 # Declare targets that do not represent actual files on disk
-.PHONY: all clean
+.PHONY: all clean test_ops
