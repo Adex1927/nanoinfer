@@ -59,6 +59,17 @@ struct BlockQ6_K {
     uint16_t d;          // super-block scale (float16)
 };
 
+// ── Helper: unpack 6-bit sub-block scale and min for Q4_K ──
+static inline void get_scale_min_k4(int j, const uint8_t *scales, uint8_t *sc, uint8_t *m) {
+    if (j < 4) {
+        *sc = scales[j] & 63;
+        *m  = scales[j + 4] & 63;
+    } else {
+        *sc = (scales[j + 4] & 0xF) | ((scales[j - 4] >> 6) << 4);
+        *m  = (scales[j + 4] >> 4)  | ((scales[j]     >> 6) << 4);
+    }
+}
+
 // ── API ──
 
 // Convert float16 (as stored in GGUF) to float32

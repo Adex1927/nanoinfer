@@ -104,6 +104,69 @@ void matvec_q8_0(float *out, const void *W, const float *x, int n_out, int n_in)
     }
 }
 
+// ── Fused Quantized Matrix-Vector Multiply (Q4_K) ──
+//
+// Fuses dequantization and dot-product for 256-weight super-blocks:
+// Each super-block has 8 sub-blocks of 32 weights.
+// For each sub-block:
+//   dot = (d * sc) * sum(quant * x) - (dmin * m) * sum(x)
+void matvec_q4_k(float *out, const void *W, const float *x, int n_out, int n_in) {
+    const BlockQ4_K *blocks = (const BlockQ4_K *)W;
+    int blocks_per_row = n_in / 256;
+
+    for (int i = 0; i < n_out; i++) {
+        const BlockQ4_K *row = blocks + i * blocks_per_row;
+        float row_sum = 0.0f;
+
+        for (int b = 0; b < blocks_per_row; b++) {
+            const BlockQ4_K *block = &row[b];
+            const float *x_super = x + b * 256;
+            const uint8_t *q = block->quants;
+
+            float d    = f16_to_f32(block->d);
+            float dmin = f16_to_f32(block->dmin);
+
+            int sub_block = 0;
+            for (int chunk = 0; chunk < 256; chunk += 64) {
+                // sub-block 1: low nibble
+                uint8_t sc, m;
+                get_scale_min_k4(sub_block, block->scales, &sc, &m);
+                float d1 = d * sc;
+                float m1 = dmin * m;
+
+                const float *x_sub1 = x_super + chunk;
+                float q_sum1 = 0.0f;
+                float x_sum1 = 0.0f;
+                for (int l = 0; l < 32; l++) {
+                    q_sum1 += (float)(q[l] & 0xF) * x_sub1[l];
+                    x_sum1 += x_sub1[l];
+                }
+                row_sum += d1 * q_sum1 - m1 * x_sum1;
+
+                // sub-block 2: high nibble
+                sub_block++;
+                get_scale_min_k4(sub_block, block->scales, &sc, &m);
+                float d2 = d * sc;
+                float m2 = dmin * m;
+
+                const float *x_sub2 = x_super + chunk + 32;
+                float q_sum2 = 0.0f;
+                float x_sum2 = 0.0f;
+                for (int l = 0; l < 32; l++) {
+                    q_sum2 += (float)(q[l] >> 4) * x_sub2[l];
+                    x_sum2 += x_sub2[l];
+                }
+                row_sum += d2 * q_sum2 - m2 * x_sum2;
+
+                q += 32;
+                sub_block++;
+            }
+        }
+
+        out[i] = row_sum;
+    }
+}
+
 // ── Softmax ──
 //
 // Used in attention to turn raw dot-product scores into weights that sum to 1.

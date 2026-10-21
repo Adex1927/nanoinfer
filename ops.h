@@ -40,6 +40,11 @@ void matvec(float *out, const float *W, const float *x, int n_out, int n_in);
 // W points to row-major BlockQ8_0 blocks. n_in must be a multiple of 32.
 void matvec_q8_0(float *out, const void *W, const float *x, int n_out, int n_in);
 
+// ── Fused Quantized Matrix-Vector Multiply (Q4_K) ──
+// Computes: out = W * x directly from quantized 256-weight super-blocks.
+// W points to row-major BlockQ4_K blocks. n_in must be a multiple of 256.
+void matvec_q4_k(float *out, const void *W, const float *x, int n_out, int n_in);
+
 // ── Softmax ──
 // Converts a vector of raw scores into a probability distribution.
 // All output values are in (0, 1] and sum to 1.0.

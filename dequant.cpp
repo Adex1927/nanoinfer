@@ -88,14 +88,8 @@ void dequantize_q8_0(const void *src, float *dst, size_t n_elements) {
 //   scale = (scales[j+4] & 0xF) | ((scales[j-4] >> 6) << 4)
 //   min   = (scales[j+4] >> 4)  | ((scales[j]   >> 6) << 4)
 
-static void get_scale_min(int j, const uint8_t *scales, uint8_t *sc, uint8_t *m) {
-    if (j < 4) {
-        *sc = scales[j] & 63;
-        *m  = scales[j + 4] & 63;
-    } else {
-        *sc = (scales[j + 4] & 0xF) | ((scales[j - 4] >> 6) << 4);
-        *m  = (scales[j + 4] >> 4)  | ((scales[j]     >> 6) << 4);
-    }
+static inline void get_scale_min(int j, const uint8_t *scales, uint8_t *sc, uint8_t *m) {
+    get_scale_min_k4(j, scales, sc, m);
 }
 
 void dequantize_q4_k(const void *src, float *dst, size_t n_elements) {

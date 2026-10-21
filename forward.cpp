@@ -21,6 +21,23 @@ static float *dequant(LlamaModel *llama, TensorInfo *info) {
     return buf;
 }
 
+// ── matvec_tensor ──
+// Fused quantized matvec dispatcher:
+// Evaluates quantized blocks in-place without heap allocation.
+// Falls back to dequant + matvec if format is not yet fused.
+static void matvec_tensor(float *out, LlamaModel *llama, TensorInfo *info, const float *x, int n_out, int n_in) {
+    const void *raw = get_tensor_data(llama->model, info->name);
+    if (info->type == GGML_TYPE_Q4_K && (n_in % 256 == 0)) {
+        matvec_q4_k(out, raw, x, n_out, n_in);
+    } else if (info->type == GGML_TYPE_Q8_0 && (n_in % 32 == 0)) {
+        matvec_q8_0(out, raw, x, n_out, n_in);
+    } else {
+        float *w = dequant(llama, info);
+        matvec(out, w, x, n_out, n_in);
+        free(w);
+    }
+}
+
 // ── mha — Multi-Head Attention with Grouped Query Attention ──
 //
 // This is the heart of the transformer. It lets every token look back at all
@@ -130,17 +147,9 @@ void forward_layer(LlamaModel *llama, InferState *s, int layer, int pos,
     // 2. Q / K / V projections: s->xb → s->q, s->k, s->v
     {
         auto t = pa_qkv->start();
-        float *wq = dequant(llama, lw.attn_q);
-        matvec(s->q, wq, s->xb, n_embd, n_embd);
-        free(wq);
-
-        float *wk = dequant(llama, lw.attn_k);
-        matvec(s->k, wk, s->xb, kv_dim, n_embd);
-        free(wk);
-
-        float *wv = dequant(llama, lw.attn_v);
-        matvec(s->v, wv, s->xb, kv_dim, n_embd);
-        free(wv);
+        matvec_tensor(s->q, llama, lw.attn_q, s->xb, n_embd, n_embd);
+        matvec_tensor(s->k, llama, lw.attn_k, s->xb, kv_dim, n_embd);
+        matvec_tensor(s->v, llama, lw.attn_v, s->xb, kv_dim, n_embd);
         pa_qkv->stop(t);
     }
 
@@ -167,10 +176,8 @@ void forward_layer(LlamaModel *llama, InferState *s, int layer, int pos,
     //    The residual add is the "skip connection" around the attention block.
     {
         auto t = pa_out_proj->start();
-        float *wo  = dequant(llama, lw.attn_output);
         float *xb2 = (float *)calloc(n_embd, sizeof(float));
-        matvec(xb2, wo, s->xb, n_embd, n_embd);
-        free(wo);
+        matvec_tensor(xb2, llama, lw.attn_output, s->xb, n_embd, n_embd);
 
         for (int i = 0; i < n_embd; i++) s->x[i] += xb2[i];  // residual add
         free(xb2);
@@ -190,13 +197,8 @@ void forward_layer(LlamaModel *llama, InferState *s, int layer, int pos,
         // 7. Gate and Up projections: both read the same s->xb, produce n_ff outputs.
         //    SwiGLU formula: FFN(x) = (silu(gate) ⊙ up) · W_down
         {
-            float *wgate = dequant(llama, lw.ffn_gate);
-            matvec(s->hb,  wgate, s->xb, n_ff, n_embd);  // gate → hb
-            free(wgate);
-
-            float *wup   = dequant(llama, lw.ffn_up);
-            matvec(s->hb2, wup,   s->xb, n_ff, n_embd);  // up   → hb2
-            free(wup);
+            matvec_tensor(s->hb,  llama, lw.ffn_gate, s->xb, n_ff, n_embd);  // gate → hb
+            matvec_tensor(s->hb2, llama, lw.ffn_up,   s->xb, n_ff, n_embd);  // up   → hb2
         }
 
         // 8. SwiGLU activation: apply silu to gate, then element-wise multiply by up.
@@ -205,10 +207,8 @@ void forward_layer(LlamaModel *llama, InferState *s, int layer, int pos,
 
         // 9. Down projection: n_ff → n_embd, then residual add.
         {
-            float *wdown = dequant(llama, lw.ffn_down);
             float *xb2   = (float *)calloc(n_embd, sizeof(float));
-            matvec(xb2, wdown, s->hb, n_embd, n_ff);
-            free(wdown);
+            matvec_tensor(xb2, llama, lw.ffn_down, s->hb, n_embd, n_ff);
 
             for (int i = 0; i < n_embd; i++) s->x[i] += xb2[i];  // residual add
             free(xb2);
@@ -283,14 +283,7 @@ void forward_token(LlamaModel *llama, InferState *s, int token, int pos, bool ne
         Probe p("final_norm_and_lm_head");
         float *w = (float *)get_tensor_data(llama->model, llama->output_norm->name);
         rmsnorm(s->x, s->x, w, s->n_embd, llama->hparams.rms_norm_eps);
-
-        TensorInfo *out_info = llama->output;
-        uint64_t n = 1;
-        for (uint32_t d = 0; d < out_info->n_dims; d++) n *= out_info->dims[d];
-        float *wout = (float *)calloc(n, sizeof(float));
-        dequantize(get_tensor_data(llama->model, out_info->name), wout, n, out_info->type);
-        matvec(s->logits, wout, s->x, s->n_vocab, s->n_embd);
-        free(wout);
+        matvec_tensor(s->logits, llama, llama->output, s->x, s->n_vocab, s->n_embd);
     }
 }
 
