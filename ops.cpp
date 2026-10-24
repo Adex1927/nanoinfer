@@ -3,6 +3,10 @@
 #include <cmath>
 #include <cstring>
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 // ── RMSNorm ──
 //
 // This is the very first computation in each transformer layer.
@@ -89,21 +93,44 @@ static void matvec_q8_0_impl(float *out, const void *W, const float *x, int n_ou
             const float *x_block = x + b * 32;
             float block_sum = 0.0f;
 
-            for (int j = 0; j < 32; j++) {
-                if constexpr (Mode == DiagMode::MEM_ONLY) {
+            if constexpr (Mode == DiagMode::MEM_ONLY) {
+                for (int j = 0; j < 32; j++) {
                     block_sum += (float)row[b].quants[j];
-                } else if constexpr (Mode == DiagMode::COMPUTE_2X) {
+                }
+                row_sum += block_sum;
+            } else if constexpr (Mode == DiagMode::COMPUTE_2X) {
+                for (int j = 0; j < 32; j++) {
                     float q = (float)row[b].quants[j];
                     block_sum += q * x_block[j];
                     block_sum += (q + 1.0f) * x_block[j];
-                } else {
+                }
+                row_sum += f16_to_f32(row[b].scale) * block_sum;
+            } else {
+#if defined(__ARM_NEON)
+                float32x4_t acc = vdupq_n_f32(0.0f);
+
+                for (int j = 0; j < 32; j += 8) {
+                    // Load 8 weights and widen to floats
+                    int8x8_t q8 = vld1_s8(&row[b].quants[j]);
+                    int16x8_t q16 = vmovl_s8(q8);
+                    float32x4_t qf_low  = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16)));
+                    float32x4_t qf_high = vcvtq_f32_s32(vmovl_high_s16(q16));
+
+                    // Load 8 activations
+                    float32x4_t x_low  = vld1q_f32(x_block + j);
+                    float32x4_t x_high = vld1q_f32(x_block + j + 4);
+
+                    // Fused multiply-accumulate
+                    acc = vfmaq_f32(acc, qf_low,  x_low);
+                    acc = vfmaq_f32(acc, qf_high, x_high);
+                }
+
+                block_sum = vaddvq_f32(acc);
+#else
+                for (int j = 0; j < 32; j++) {
                     block_sum += (float)row[b].quants[j] * x_block[j];
                 }
-            }
-
-            if constexpr (Mode == DiagMode::MEM_ONLY) {
-                row_sum += block_sum;
-            } else {
+#endif
                 row_sum += f16_to_f32(row[b].scale) * block_sum;
             }
         }
