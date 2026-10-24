@@ -172,18 +172,26 @@ static void matvec_q4_k_impl(float *out, const void *W, const float *x, int n_ou
             int sub_block = 0;
             for (int chunk = 0; chunk < 256; chunk += 64) {
                 // sub-block 1: low nibble
-                uint8_t sc, m;
-                get_scale_min_k4(sub_block, block->scales, &sc, &m);
-                float d1 = d * sc;
-                float m1 = dmin * m;
+                uint8_t sc1, m1_raw;
+                get_scale_min_k4(sub_block, block->scales, &sc1, &m1_raw);
+                float d1 = d * sc1;
+                float m1 = dmin * m1_raw;
+
+                // sub-block 2: high nibble
+                uint8_t sc2, m2_raw;
+                get_scale_min_k4(sub_block + 1, block->scales, &sc2, &m2_raw);
+                float d2 = d * sc2;
+                float m2 = dmin * m2_raw;
 
                 const float *x_sub1 = x_super + chunk;
+                const float *x_sub2 = x_super + chunk + 32;
+
                 if constexpr (Mode == DiagMode::MEM_ONLY) {
-                    uint32_t q_sum1 = 0;
+                    uint32_t q_sum = 0;
                     for (int l = 0; l < 32; l++) {
-                        q_sum1 += q[l];
+                        q_sum += q[l];
                     }
-                    row_sum += (float)q_sum1;
+                    row_sum += (float)(q_sum * 2);
                 } else if constexpr (Mode == DiagMode::COMPUTE_2X) {
                     float q_sum1 = 0.0f;
                     float x_sum1 = 0.0f;
@@ -195,30 +203,7 @@ static void matvec_q4_k_impl(float *out, const void *W, const float *x, int n_ou
                         x_sum1 += x_val;
                     }
                     row_sum += d1 * q_sum1 - m1 * x_sum1;
-                } else {
-                    float q_sum1 = 0.0f;
-                    float x_sum1 = 0.0f;
-                    for (int l = 0; l < 32; l++) {
-                        q_sum1 += (float)(q[l] & 0xF) * x_sub1[l];
-                        x_sum1 += x_sub1[l];
-                    }
-                    row_sum += d1 * q_sum1 - m1 * x_sum1;
-                }
 
-                // sub-block 2: high nibble
-                sub_block++;
-                get_scale_min_k4(sub_block, block->scales, &sc, &m);
-                float d2 = d * sc;
-                float m2 = dmin * m;
-
-                const float *x_sub2 = x_super + chunk + 32;
-                if constexpr (Mode == DiagMode::MEM_ONLY) {
-                    uint32_t q_sum2 = 0;
-                    for (int l = 0; l < 32; l++) {
-                        q_sum2 += q[l];
-                    }
-                    row_sum += (float)q_sum2;
-                } else if constexpr (Mode == DiagMode::COMPUTE_2X) {
                     float q_sum2 = 0.0f;
                     float x_sum2 = 0.0f;
                     for (int l = 0; l < 32; l++) {
@@ -230,6 +215,61 @@ static void matvec_q4_k_impl(float *out, const void *W, const float *x, int n_ou
                     }
                     row_sum += d2 * q_sum2 - m2 * x_sum2;
                 } else {
+#if defined(__ARM_NEON)
+                    float32x4_t acc_q1 = vdupq_n_f32(0.0f);
+                    float32x4_t acc_x1 = vdupq_n_f32(0.0f);
+                    float32x4_t acc_q2 = vdupq_n_f32(0.0f);
+                    float32x4_t acc_x2 = vdupq_n_f32(0.0f);
+
+                    uint8x8_t mask = vdup_n_u8(0x0F);
+
+                    for (int l = 0; l < 32; l += 8) {
+                        uint8x8_t bytes = vld1_u8(q + l);
+                        uint8x8_t q1_u8 = vand_u8(bytes, mask);
+                        uint8x8_t q2_u8 = vshr_n_u8(bytes, 4);
+
+                        // ── Sub-block 1 ──
+                        uint16x8_t q1_16  = vmovl_u8(q1_u8);
+                        float32x4_t q1_f0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(q1_16)));
+                        float32x4_t q1_f1 = vcvtq_f32_u32(vmovl_high_u16(q1_16));
+
+                        float32x4_t x1_0  = vld1q_f32(x_sub1 + l);
+                        float32x4_t x1_1  = vld1q_f32(x_sub1 + l + 4);
+
+                        acc_q1 = vfmaq_f32(acc_q1, q1_f0, x1_0);
+                        acc_q1 = vfmaq_f32(acc_q1, q1_f1, x1_1);
+                        acc_x1 = vaddq_f32(acc_x1, x1_0);
+                        acc_x1 = vaddq_f32(acc_x1, x1_1);
+
+                        // ── Sub-block 2 ──
+                        uint16x8_t q2_16  = vmovl_u8(q2_u8);
+                        float32x4_t q2_f0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(q2_16)));
+                        float32x4_t q2_f1 = vcvtq_f32_u32(vmovl_high_u16(q2_16));
+
+                        float32x4_t x2_0  = vld1q_f32(x_sub2 + l);
+                        float32x4_t x2_1  = vld1q_f32(x_sub2 + l + 4);
+
+                        acc_q2 = vfmaq_f32(acc_q2, q2_f0, x2_0);
+                        acc_q2 = vfmaq_f32(acc_q2, q2_f1, x2_1);
+                        acc_x2 = vaddq_f32(acc_x2, x2_0);
+                        acc_x2 = vaddq_f32(acc_x2, x2_1);
+                    }
+
+                    float q_sum1 = vaddvq_f32(acc_q1);
+                    float x_sum1 = vaddvq_f32(acc_x1);
+                    float q_sum2 = vaddvq_f32(acc_q2);
+                    float x_sum2 = vaddvq_f32(acc_x2);
+
+                    row_sum += (d1 * q_sum1 - m1 * x_sum1) + (d2 * q_sum2 - m2 * x_sum2);
+#else
+                    float q_sum1 = 0.0f;
+                    float x_sum1 = 0.0f;
+                    for (int l = 0; l < 32; l++) {
+                        q_sum1 += (float)(q[l] & 0xF) * x_sub1[l];
+                        x_sum1 += x_sub1[l];
+                    }
+                    row_sum += d1 * q_sum1 - m1 * x_sum1;
+
                     float q_sum2 = 0.0f;
                     float x_sum2 = 0.0f;
                     for (int l = 0; l < 32; l++) {
@@ -237,10 +277,11 @@ static void matvec_q4_k_impl(float *out, const void *W, const float *x, int n_ou
                         x_sum2 += x_sub2[l];
                     }
                     row_sum += d2 * q_sum2 - m2 * x_sum2;
+#endif
                 }
 
                 q += 32;
-                sub_block++;
+                sub_block += 2;
             }
         }
 
