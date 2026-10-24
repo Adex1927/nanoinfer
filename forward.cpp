@@ -26,16 +26,28 @@ static float *dequant(LlamaModel *llama, TensorInfo *info) {
 // Evaluates quantized blocks in-place without heap allocation.
 // Falls back to dequant + matvec if format is not yet fused.
 static void matvec_tensor(float *out, LlamaModel *llama, TensorInfo *info, const float *x, int n_out, int n_in) {
-    const void *raw = get_tensor_data(llama->model, info->name);
-    if (info->type == GGML_TYPE_Q4_K && (n_in % 256 == 0)) {
-        matvec_q4_k(out, raw, x, n_out, n_in);
-    } else if (info->type == GGML_TYPE_Q8_0 && (n_in % 32 == 0)) {
-        matvec_q8_0(out, raw, x, n_out, n_in);
-    } else {
-        float *w = dequant(llama, info);
-        matvec(out, w, x, n_out, n_in);
-        free(w);
+    static const bool force_old = (getenv("NANO_OLD_MATVEC") != nullptr);
+    static const DiagMode diag_mode = []() {
+        const char *d = getenv("NANO_DIAG");
+        if (!d) return DiagMode::NORMAL;
+        if (strcmp(d, "mem") == 0) return DiagMode::MEM_ONLY;
+        if (strcmp(d, "compute") == 0) return DiagMode::COMPUTE_2X;
+        return DiagMode::NORMAL;
+    }();
+
+    if (!force_old) {
+        const void *raw = get_tensor_data(llama->model, info->name);
+        if (info->type == GGML_TYPE_Q4_K && (n_in % 256 == 0)) {
+            matvec_q4_k_diag(out, raw, x, n_out, n_in, diag_mode);
+            return;
+        } else if (info->type == GGML_TYPE_Q8_0 && (n_in % 32 == 0)) {
+            matvec_q8_0_diag(out, raw, x, n_out, n_in, diag_mode);
+            return;
+        }
     }
+    float *w = dequant(llama, info);
+    matvec(out, w, x, n_out, n_in);
+    free(w);
 }
 
 // ── mha — Multi-Head Attention with Grouped Query Attention ──

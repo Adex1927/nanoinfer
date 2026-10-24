@@ -17,9 +17,16 @@ $(TARGET): $(SRCS)
 test_ops: tests/test_ops.cpp ops.cpp dequant.cpp
 	$(CXX) $(CXXFLAGS) -I. -o $@ $^
 
+# Benchmarks
+bench_ops: benchmarks/bench_ops.cpp ops.cpp dequant.cpp
+	$(CXX) $(CXXFLAGS) -I. -o $@ $^
+
+bench: bench_ops
+	./bench_ops
+
 # Cleanup build artifacts
 clean:
-	rm -f $(TARGET) test_ops
+	rm -f $(TARGET) test_ops bench_ops
 
 # Declare targets that do not represent actual files on disk
-.PHONY: all clean test_ops
+.PHONY: all clean test_ops bench bench_ops

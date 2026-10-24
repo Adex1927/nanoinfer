@@ -35,15 +35,24 @@ void rmsnorm(float *out, const float *x, const float *weight, int n, float eps =
 //
 void matvec(float *out, const float *W, const float *x, int n_out, int n_in);
 
+// ── Diagnostic Modes for Profiling ──
+enum class DiagMode {
+    NORMAL,     // Standard fused GEMV
+    MEM_ONLY,   // Test A: stream memory directly, drop float arithmetic
+    COMPUTE_2X  // Test B: double arithmetic with identical memory traffic
+};
+
 // ── Fused Quantized Matrix-Vector Multiply (Q8_0) ──
 // Computes: out = W * x directly from quantized blocks without float allocation.
 // W points to row-major BlockQ8_0 blocks. n_in must be a multiple of 32.
 void matvec_q8_0(float *out, const void *W, const float *x, int n_out, int n_in);
+void matvec_q8_0_diag(float *out, const void *W, const float *x, int n_out, int n_in, DiagMode mode);
 
 // ── Fused Quantized Matrix-Vector Multiply (Q4_K) ──
 // Computes: out = W * x directly from quantized 256-weight super-blocks.
 // W points to row-major BlockQ4_K blocks. n_in must be a multiple of 256.
 void matvec_q4_k(float *out, const void *W, const float *x, int n_out, int n_in);
+void matvec_q4_k_diag(float *out, const void *W, const float *x, int n_out, int n_in, DiagMode mode);
 
 // ── Softmax ──
 // Converts a vector of raw scores into a probability distribution.

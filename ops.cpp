@@ -76,12 +76,8 @@ void matvec(float *out, const float *W, const float *x, int n_out, int n_in) {
 }
 
 // ── Fused Quantized Matrix-Vector Multiply (Q8_0) ──
-//
-// Fuses dequantization and dot-product directly in registers:
-// For each block of 32 weights:
-//   dot_block = scale * sum(quant[j] * x[j])
-// Eliminates the need to allocate or write full float weight matrices to RAM.
-void matvec_q8_0(float *out, const void *W, const float *x, int n_out, int n_in) {
+template <DiagMode Mode>
+static void matvec_q8_0_impl(float *out, const void *W, const float *x, int n_out, int n_in) {
     const BlockQ8_0 *blocks = (const BlockQ8_0 *)W;
     int blocks_per_row = n_in / 32;
 
@@ -94,23 +90,43 @@ void matvec_q8_0(float *out, const void *W, const float *x, int n_out, int n_in)
             float block_sum = 0.0f;
 
             for (int j = 0; j < 32; j++) {
-                block_sum += (float)row[b].quants[j] * x_block[j];
+                if constexpr (Mode == DiagMode::MEM_ONLY) {
+                    block_sum += (float)row[b].quants[j];
+                } else if constexpr (Mode == DiagMode::COMPUTE_2X) {
+                    float q = (float)row[b].quants[j];
+                    block_sum += q * x_block[j];
+                    block_sum += (q + 1.0f) * x_block[j];
+                } else {
+                    block_sum += (float)row[b].quants[j] * x_block[j];
+                }
             }
 
-            row_sum += f16_to_f32(row[b].scale) * block_sum;
+            if constexpr (Mode == DiagMode::MEM_ONLY) {
+                row_sum += block_sum;
+            } else {
+                row_sum += f16_to_f32(row[b].scale) * block_sum;
+            }
         }
 
         out[i] = row_sum;
     }
 }
 
+void matvec_q8_0_diag(float *out, const void *W, const float *x, int n_out, int n_in, DiagMode mode) {
+    switch (mode) {
+        case DiagMode::MEM_ONLY:   matvec_q8_0_impl<DiagMode::MEM_ONLY>(out, W, x, n_out, n_in); break;
+        case DiagMode::COMPUTE_2X: matvec_q8_0_impl<DiagMode::COMPUTE_2X>(out, W, x, n_out, n_in); break;
+        default:                   matvec_q8_0_impl<DiagMode::NORMAL>(out, W, x, n_out, n_in); break;
+    }
+}
+
+void matvec_q8_0(float *out, const void *W, const float *x, int n_out, int n_in) {
+    matvec_q8_0_impl<DiagMode::NORMAL>(out, W, x, n_out, n_in);
+}
+
 // ── Fused Quantized Matrix-Vector Multiply (Q4_K) ──
-//
-// Fuses dequantization and dot-product for 256-weight super-blocks:
-// Each super-block has 8 sub-blocks of 32 weights.
-// For each sub-block:
-//   dot = (d * sc) * sum(quant * x) - (dmin * m) * sum(x)
-void matvec_q4_k(float *out, const void *W, const float *x, int n_out, int n_in) {
+template <DiagMode Mode>
+static void matvec_q4_k_impl(float *out, const void *W, const float *x, int n_out, int n_in) {
     const BlockQ4_K *blocks = (const BlockQ4_K *)W;
     int blocks_per_row = n_in / 256;
 
@@ -135,13 +151,32 @@ void matvec_q4_k(float *out, const void *W, const float *x, int n_out, int n_in)
                 float m1 = dmin * m;
 
                 const float *x_sub1 = x_super + chunk;
-                float q_sum1 = 0.0f;
-                float x_sum1 = 0.0f;
-                for (int l = 0; l < 32; l++) {
-                    q_sum1 += (float)(q[l] & 0xF) * x_sub1[l];
-                    x_sum1 += x_sub1[l];
+                if constexpr (Mode == DiagMode::MEM_ONLY) {
+                    uint32_t q_sum1 = 0;
+                    for (int l = 0; l < 32; l++) {
+                        q_sum1 += q[l];
+                    }
+                    row_sum += (float)q_sum1;
+                } else if constexpr (Mode == DiagMode::COMPUTE_2X) {
+                    float q_sum1 = 0.0f;
+                    float x_sum1 = 0.0f;
+                    for (int l = 0; l < 32; l++) {
+                        float q_val = (float)(q[l] & 0xF);
+                        float x_val = x_sub1[l];
+                        q_sum1 += q_val * x_val;
+                        q_sum1 += (q_val + 1.0f) * x_val;
+                        x_sum1 += x_val;
+                    }
+                    row_sum += d1 * q_sum1 - m1 * x_sum1;
+                } else {
+                    float q_sum1 = 0.0f;
+                    float x_sum1 = 0.0f;
+                    for (int l = 0; l < 32; l++) {
+                        q_sum1 += (float)(q[l] & 0xF) * x_sub1[l];
+                        x_sum1 += x_sub1[l];
+                    }
+                    row_sum += d1 * q_sum1 - m1 * x_sum1;
                 }
-                row_sum += d1 * q_sum1 - m1 * x_sum1;
 
                 // sub-block 2: high nibble
                 sub_block++;
@@ -150,13 +185,32 @@ void matvec_q4_k(float *out, const void *W, const float *x, int n_out, int n_in)
                 float m2 = dmin * m;
 
                 const float *x_sub2 = x_super + chunk + 32;
-                float q_sum2 = 0.0f;
-                float x_sum2 = 0.0f;
-                for (int l = 0; l < 32; l++) {
-                    q_sum2 += (float)(q[l] >> 4) * x_sub2[l];
-                    x_sum2 += x_sub2[l];
+                if constexpr (Mode == DiagMode::MEM_ONLY) {
+                    uint32_t q_sum2 = 0;
+                    for (int l = 0; l < 32; l++) {
+                        q_sum2 += q[l];
+                    }
+                    row_sum += (float)q_sum2;
+                } else if constexpr (Mode == DiagMode::COMPUTE_2X) {
+                    float q_sum2 = 0.0f;
+                    float x_sum2 = 0.0f;
+                    for (int l = 0; l < 32; l++) {
+                        float q_val = (float)(q[l] >> 4);
+                        float x_val = x_sub2[l];
+                        q_sum2 += q_val * x_val;
+                        q_sum2 += (q_val + 1.0f) * x_val;
+                        x_sum2 += x_val;
+                    }
+                    row_sum += d2 * q_sum2 - m2 * x_sum2;
+                } else {
+                    float q_sum2 = 0.0f;
+                    float x_sum2 = 0.0f;
+                    for (int l = 0; l < 32; l++) {
+                        q_sum2 += (float)(q[l] >> 4) * x_sub2[l];
+                        x_sum2 += x_sub2[l];
+                    }
+                    row_sum += d2 * q_sum2 - m2 * x_sum2;
                 }
-                row_sum += d2 * q_sum2 - m2 * x_sum2;
 
                 q += 32;
                 sub_block++;
@@ -165,6 +219,18 @@ void matvec_q4_k(float *out, const void *W, const float *x, int n_out, int n_in)
 
         out[i] = row_sum;
     }
+}
+
+void matvec_q4_k_diag(float *out, const void *W, const float *x, int n_out, int n_in, DiagMode mode) {
+    switch (mode) {
+        case DiagMode::MEM_ONLY:   matvec_q4_k_impl<DiagMode::MEM_ONLY>(out, W, x, n_out, n_in); break;
+        case DiagMode::COMPUTE_2X: matvec_q4_k_impl<DiagMode::COMPUTE_2X>(out, W, x, n_out, n_in); break;
+        default:                   matvec_q4_k_impl<DiagMode::NORMAL>(out, W, x, n_out, n_in); break;
+    }
+}
+
+void matvec_q4_k(float *out, const void *W, const float *x, int n_out, int n_in) {
+    matvec_q4_k_impl<DiagMode::NORMAL>(out, W, x, n_out, n_in);
 }
 
 // ── Softmax ──
