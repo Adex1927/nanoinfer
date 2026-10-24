@@ -54,6 +54,12 @@ void matvec_q8_0_diag(float *out, const void *W, const float *x, int n_out, int 
 void matvec_q4_k(float *out, const void *W, const float *x, int n_out, int n_in);
 void matvec_q4_k_diag(float *out, const void *W, const float *x, int n_out, int n_in, DiagMode mode);
 
+// ── Fused Quantized Matrix-Vector Multiply (Q6_K) ──
+// Computes: out = W * x directly from quantized 256-weight super-blocks.
+// W points to row-major BlockQ6_K blocks. n_in must be a multiple of 256.
+void matvec_q6_k(float *out, const void *W, const float *x, int n_out, int n_in);
+void matvec_q6_k_diag(float *out, const void *W, const float *x, int n_out, int n_in, DiagMode mode);
+
 // ── Softmax ──
 // Converts a vector of raw scores into a probability distribution.
 // All output values are in (0, 1] and sum to 1.0.

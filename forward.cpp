@@ -43,6 +43,9 @@ static void matvec_tensor(float *out, LlamaModel *llama, TensorInfo *info, const
         } else if (info->type == GGML_TYPE_Q8_0 && (n_in % 32 == 0)) {
             matvec_q8_0_diag(out, raw, x, n_out, n_in, diag_mode);
             return;
+        } else if (info->type == GGML_TYPE_Q6_K && (n_in % 256 == 0)) {
+            matvec_q6_k_diag(out, raw, x, n_out, n_in, diag_mode);
+            return;
         }
     }
     float *w = dequant(llama, info);

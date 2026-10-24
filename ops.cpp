@@ -301,6 +301,120 @@ void matvec_q4_k(float *out, const void *W, const float *x, int n_out, int n_in)
     matvec_q4_k_impl<DiagMode::NORMAL>(out, W, x, n_out, n_in);
 }
 
+// ── Fused Quantized Matrix-Vector Multiply (Q6_K) ──
+template <DiagMode Mode>
+static void matvec_q6_k_impl(float *out, const void *W, const float *x, int n_out, int n_in) {
+    const BlockQ6_K *blocks = (const BlockQ6_K *)W;
+    int blocks_per_row = n_in / 256;
+
+    for (int i = 0; i < n_out; i++) {
+        const BlockQ6_K *row = blocks + i * blocks_per_row;
+        float row_sum = 0.0f;
+
+        for (int b = 0; b < blocks_per_row; b++) {
+            const BlockQ6_K *block = &row[b];
+            float d = f16_to_f32(block->d);
+
+            const uint8_t *ql = block->ql;
+            const uint8_t *qh = block->qh;
+            const int8_t  *sc = block->scales;
+            const float   *x_block = x + b * 256;
+
+            float block_sum = 0.0f;
+
+            for (int half = 0; half < 2; half++) {
+                const float *x_half = x_block + half * 128;
+
+#if defined(__ARM_NEON)
+                float32x4_t acc = vdupq_n_f32(0.0f);
+
+                uint8x8_t mask_0f = vdup_n_u8(0x0F);
+                uint8x8_t mask_03 = vdup_n_u8(0x03);
+                uint8x8_t c32     = vdup_n_u8(32);
+
+                for (int l = 0; l < 32; l += 8) {
+                    int is = l / 16;
+
+                    // 1. Load 8 bytes each of ql and qh
+                    uint8x8_t ql_a = vld1_u8(ql + l);
+                    uint8x8_t ql_b = vld1_u8(ql + l + 32);
+                    uint8x8_t qh_v = vld1_u8(qh + l);
+
+                    // 2. Extract 4-bit low nibbles
+                    uint8x8_t q1_low = vand_u8(ql_a, mask_0f);
+                    uint8x8_t q2_low = vand_u8(ql_b, mask_0f);
+                    uint8x8_t q3_low = vshr_n_u8(ql_a, 4);
+                    uint8x8_t q4_low = vshr_n_u8(ql_b, 4);
+
+                    // 3. Extract 2-bit high slices and shift to bits 4..5
+                    uint8x8_t q1_high = vshl_n_u8(vand_u8(qh_v, mask_03), 4);
+                    uint8x8_t q2_high = vshl_n_u8(vand_u8(vshr_n_u8(qh_v, 2), mask_03), 4);
+                    uint8x8_t q3_high = vshl_n_u8(vand_u8(vshr_n_u8(qh_v, 4), mask_03), 4);
+                    uint8x8_t q4_high = vshl_n_u8(vshr_n_u8(qh_v, 6), 4);
+
+                    // 4. Combine into 6-bit values and subtract 32 -> signed int8 [-32..+31]
+                    int8x8_t q1_s8 = vsub_s8(vreinterpret_s8_u8(vorr_u8(q1_low, q1_high)), vreinterpret_s8_u8(c32));
+                    int8x8_t q2_s8 = vsub_s8(vreinterpret_s8_u8(vorr_u8(q2_low, q2_high)), vreinterpret_s8_u8(c32));
+                    int8x8_t q3_s8 = vsub_s8(vreinterpret_s8_u8(vorr_u8(q3_low, q3_high)), vreinterpret_s8_u8(c32));
+                    int8x8_t q4_s8 = vsub_s8(vreinterpret_s8_u8(vorr_u8(q4_low, q4_high)), vreinterpret_s8_u8(c32));
+
+                    // Helper macro to widen, scale, and FMA a 8-weight vector with its x slice
+                    auto fma_scaled = [&](int8x8_t q_vec, float scale, const float *x_ptr) {
+                        int16x8_t q16 = vmovl_s8(q_vec);
+                        float32x4_t qf0 = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16))), scale);
+                        float32x4_t qf1 = vmulq_n_f32(vcvtq_f32_s32(vmovl_high_s16(q16)), scale);
+
+                        acc = vfmaq_f32(acc, qf0, vld1q_f32(x_ptr));
+                        acc = vfmaq_f32(acc, qf1, vld1q_f32(x_ptr + 4));
+                    };
+
+                    fma_scaled(q1_s8, (float)sc[is + 0], x_half + l +  0);
+                    fma_scaled(q2_s8, (float)sc[is + 2], x_half + l + 32);
+                    fma_scaled(q3_s8, (float)sc[is + 4], x_half + l + 64);
+                    fma_scaled(q4_s8, (float)sc[is + 6], x_half + l + 96);
+                }
+
+                block_sum += vaddvq_f32(acc);
+#else
+                for (int l = 0; l < 32; l++) {
+                    int is = l / 16;
+
+                    int8_t q1 = (int8_t)((ql[l]      & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                    int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                    int8_t q3 = (int8_t)((ql[l]      >> 4)  | (((qh[l] >> 4) & 3) << 4)) - 32;
+                    int8_t q4 = (int8_t)((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4)) - 32;
+
+                    block_sum += (float)q1 * x_half[l +  0] * (float)sc[is + 0];
+                    block_sum += (float)q2 * x_half[l + 32] * (float)sc[is + 2];
+                    block_sum += (float)q3 * x_half[l + 64] * (float)sc[is + 4];
+                    block_sum += (float)q4 * x_half[l + 96] * (float)sc[is + 6];
+                }
+#endif
+
+                ql += 64;
+                qh += 32;
+                sc += 8;
+            }
+
+            row_sum += d * block_sum;
+        }
+
+        out[i] = row_sum;
+    }
+}
+
+void matvec_q6_k_diag(float *out, const void *W, const float *x, int n_out, int n_in, DiagMode mode) {
+    switch (mode) {
+        case DiagMode::MEM_ONLY:   matvec_q6_k_impl<DiagMode::MEM_ONLY>(out, W, x, n_out, n_in); break;
+        case DiagMode::COMPUTE_2X: matvec_q6_k_impl<DiagMode::COMPUTE_2X>(out, W, x, n_out, n_in); break;
+        default:                   matvec_q6_k_impl<DiagMode::NORMAL>(out, W, x, n_out, n_in); break;
+    }
+}
+
+void matvec_q6_k(float *out, const void *W, const float *x, int n_out, int n_in) {
+    matvec_q6_k_impl<DiagMode::NORMAL>(out, W, x, n_out, n_in);
+}
+
 // ── Softmax ──
 //
 // Used in attention to turn raw dot-product scores into weights that sum to 1.
