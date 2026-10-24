@@ -107,7 +107,8 @@ static void matvec_q8_0_impl(float *out, const void *W, const float *x, int n_ou
                 row_sum += f16_to_f32(row[b].scale) * block_sum;
             } else {
 #if defined(__ARM_NEON)
-                float32x4_t acc = vdupq_n_f32(0.0f);
+                float32x4_t acc0 = vdupq_n_f32(0.0f);
+                float32x4_t acc1 = vdupq_n_f32(0.0f);
 
                 for (int j = 0; j < 32; j += 8) {
                     // Load 8 weights and widen to floats
@@ -120,12 +121,12 @@ static void matvec_q8_0_impl(float *out, const void *W, const float *x, int n_ou
                     float32x4_t x_low  = vld1q_f32(x_block + j);
                     float32x4_t x_high = vld1q_f32(x_block + j + 4);
 
-                    // Fused multiply-accumulate
-                    acc = vfmaq_f32(acc, qf_low,  x_low);
-                    acc = vfmaq_f32(acc, qf_high, x_high);
+                    // Fused multiply-accumulate on independent accumulators
+                    acc0 = vfmaq_f32(acc0, qf_low,  x_low);
+                    acc1 = vfmaq_f32(acc1, qf_high, x_high);
                 }
 
-                block_sum = vaddvq_f32(acc);
+                block_sum = vaddvq_f32(vaddq_f32(acc0, acc1));
 #else
                 for (int j = 0; j < 32; j++) {
                     block_sum += (float)row[b].quants[j] * x_block[j];
@@ -216,10 +217,16 @@ static void matvec_q4_k_impl(float *out, const void *W, const float *x, int n_ou
                     row_sum += d2 * q_sum2 - m2 * x_sum2;
                 } else {
 #if defined(__ARM_NEON)
-                    float32x4_t acc_q1 = vdupq_n_f32(0.0f);
-                    float32x4_t acc_x1 = vdupq_n_f32(0.0f);
-                    float32x4_t acc_q2 = vdupq_n_f32(0.0f);
-                    float32x4_t acc_x2 = vdupq_n_f32(0.0f);
+                    // Multi-accumulators: 2 independent accumulators per stream
+                    float32x4_t acc_q1_0 = vdupq_n_f32(0.0f);
+                    float32x4_t acc_q1_1 = vdupq_n_f32(0.0f);
+                    float32x4_t acc_x1_0 = vdupq_n_f32(0.0f);
+                    float32x4_t acc_x1_1 = vdupq_n_f32(0.0f);
+
+                    float32x4_t acc_q2_0 = vdupq_n_f32(0.0f);
+                    float32x4_t acc_q2_1 = vdupq_n_f32(0.0f);
+                    float32x4_t acc_x2_0 = vdupq_n_f32(0.0f);
+                    float32x4_t acc_x2_1 = vdupq_n_f32(0.0f);
 
                     uint8x8_t mask = vdup_n_u8(0x0F);
 
@@ -236,10 +243,10 @@ static void matvec_q4_k_impl(float *out, const void *W, const float *x, int n_ou
                         float32x4_t x1_0  = vld1q_f32(x_sub1 + l);
                         float32x4_t x1_1  = vld1q_f32(x_sub1 + l + 4);
 
-                        acc_q1 = vfmaq_f32(acc_q1, q1_f0, x1_0);
-                        acc_q1 = vfmaq_f32(acc_q1, q1_f1, x1_1);
-                        acc_x1 = vaddq_f32(acc_x1, x1_0);
-                        acc_x1 = vaddq_f32(acc_x1, x1_1);
+                        acc_q1_0 = vfmaq_f32(acc_q1_0, q1_f0, x1_0);
+                        acc_q1_1 = vfmaq_f32(acc_q1_1, q1_f1, x1_1);
+                        acc_x1_0 = vaddq_f32(acc_x1_0, x1_0);
+                        acc_x1_1 = vaddq_f32(acc_x1_1, x1_1);
 
                         // ── Sub-block 2 ──
                         uint16x8_t q2_16  = vmovl_u8(q2_u8);
@@ -249,16 +256,17 @@ static void matvec_q4_k_impl(float *out, const void *W, const float *x, int n_ou
                         float32x4_t x2_0  = vld1q_f32(x_sub2 + l);
                         float32x4_t x2_1  = vld1q_f32(x_sub2 + l + 4);
 
-                        acc_q2 = vfmaq_f32(acc_q2, q2_f0, x2_0);
-                        acc_q2 = vfmaq_f32(acc_q2, q2_f1, x2_1);
-                        acc_x2 = vaddq_f32(acc_x2, x2_0);
-                        acc_x2 = vaddq_f32(acc_x2, x2_1);
+                        acc_q2_0 = vfmaq_f32(acc_q2_0, q2_f0, x2_0);
+                        acc_q2_1 = vfmaq_f32(acc_q2_1, q2_f1, x2_1);
+                        acc_x2_0 = vaddq_f32(acc_x2_0, x2_0);
+                        acc_x2_1 = vaddq_f32(acc_x2_1, x2_1);
                     }
 
-                    float q_sum1 = vaddvq_f32(acc_q1);
-                    float x_sum1 = vaddvq_f32(acc_x1);
-                    float q_sum2 = vaddvq_f32(acc_q2);
-                    float x_sum2 = vaddvq_f32(acc_x2);
+                    // Combine interleaved accumulators
+                    float q_sum1 = vaddvq_f32(vaddq_f32(acc_q1_0, acc_q1_1));
+                    float x_sum1 = vaddvq_f32(vaddq_f32(acc_x1_0, acc_x1_1));
+                    float q_sum2 = vaddvq_f32(vaddq_f32(acc_q2_0, acc_q2_1));
+                    float x_sum2 = vaddvq_f32(vaddq_f32(acc_x2_0, acc_x2_1));
 
                     row_sum += (d1 * q_sum1 - m1 * x_sum1) + (d2 * q_sum2 - m2 * x_sum2);
 #else
@@ -326,7 +334,8 @@ static void matvec_q6_k_impl(float *out, const void *W, const float *x, int n_ou
                 const float *x_half = x_block + half * 128;
 
 #if defined(__ARM_NEON)
-                float32x4_t acc = vdupq_n_f32(0.0f);
+                float32x4_t acc0 = vdupq_n_f32(0.0f);
+                float32x4_t acc1 = vdupq_n_f32(0.0f);
 
                 uint8x8_t mask_0f = vdup_n_u8(0x0F);
                 uint8x8_t mask_03 = vdup_n_u8(0x03);
@@ -358,14 +367,14 @@ static void matvec_q6_k_impl(float *out, const void *W, const float *x, int n_ou
                     int8x8_t q3_s8 = vsub_s8(vreinterpret_s8_u8(vorr_u8(q3_low, q3_high)), vreinterpret_s8_u8(c32));
                     int8x8_t q4_s8 = vsub_s8(vreinterpret_s8_u8(vorr_u8(q4_low, q4_high)), vreinterpret_s8_u8(c32));
 
-                    // Helper macro to widen, scale, and FMA a 8-weight vector with its x slice
+                    // Helper lambda using 2 independent accumulators
                     auto fma_scaled = [&](int8x8_t q_vec, float scale, const float *x_ptr) {
                         int16x8_t q16 = vmovl_s8(q_vec);
                         float32x4_t qf0 = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16))), scale);
                         float32x4_t qf1 = vmulq_n_f32(vcvtq_f32_s32(vmovl_high_s16(q16)), scale);
 
-                        acc = vfmaq_f32(acc, qf0, vld1q_f32(x_ptr));
-                        acc = vfmaq_f32(acc, qf1, vld1q_f32(x_ptr + 4));
+                        acc0 = vfmaq_f32(acc0, qf0, vld1q_f32(x_ptr));
+                        acc1 = vfmaq_f32(acc1, qf1, vld1q_f32(x_ptr + 4));
                     };
 
                     fma_scaled(q1_s8, (float)sc[is + 0], x_half + l +  0);
@@ -374,7 +383,7 @@ static void matvec_q6_k_impl(float *out, const void *W, const float *x, int n_ou
                     fma_scaled(q4_s8, (float)sc[is + 6], x_half + l + 96);
                 }
 
-                block_sum += vaddvq_f32(acc);
+                block_sum += vaddvq_f32(vaddq_f32(acc0, acc1));
 #else
                 for (int l = 0; l < 32; l++) {
                     int is = l / 16;

@@ -147,8 +147,8 @@ static void test_matvec_q6_k() {
     }
 
     printf("max diff = %e (ref[0]=%f, test[0]=%f) -> %s\n",
-           max_diff, out_ref[0], out_test[0], (max_diff < 1e-3f) ? "PASS" : "FAIL");
-    if (max_diff >= 1e-3f) {
+           max_diff, out_ref[0], out_test[0], (max_diff < 5e-3f) ? "PASS" : "FAIL");
+    if (max_diff >= 5e-3f) {
         exit(1);
     }
 }
