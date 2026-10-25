@@ -6,10 +6,11 @@ import csv
 from collections import defaultdict
 
 def run_benchmark(model_path, tokens=30):
-    cmd = ["./model_test", model_path, "-n", str(tokens)]
+    cmd = ["./model_test", model_path]
     csv_file = "probe.csv"
     env = os.environ.copy()
     env["NANO_PROBE_CSV"] = csv_file
+    env["NANO_N"] = str(tokens)
 
     print(f"Running benchmark on {model_path} ({tokens} tokens)...")
     res = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

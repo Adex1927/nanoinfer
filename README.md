@@ -78,30 +78,30 @@ first 10 dequantized weights: -0.012451 0.003906 -0.021484 ...
 
 ## Performance & Benchmarks
 
-Measured on Apple Silicon (single-threaded ARM NEON with multi-accumulators) running **TinyLlama 1.1B (`Q4_K_M`)**:
+Measured on Apple Silicon (ARM NEON, multi-accumulators, 4 threads) running **TinyLlama 1.1B (`Q4_K_M`)** across **200 generated tokens**:
 
-- **Decode Latency:** **~151 ms/token** (~6.60 tokens/sec) — down from **1041 ms/token** baseline (**~6.9× speedup**)
+- **Decode Latency:** **~65.4 ms/token** (~15.3 tokens/sec) — down from **1041 ms/token** baseline (**~15.9× speedup**)
 - **DRAM Traffic per Token:** **0 GB** (fused in-register quantized GEMV)
 
-### Breakdown by Component (from `probe.csv`)
+### Breakdown by Component (averaged over 200 tokens from `probe.csv`)
 
 | Component / Stage | Phase | Samples | Avg Latency | Notes |
 | :--- | :--- | :--- | :--- | :--- |
-| `decode:forward_token` | `decode` | 50 | **151.48 ms** | Total per-token decode step |
-| `all_layers` | `decode` | 50 | **122.67 ms** | 22 transformer layers combined |
-| ├── `layer:ffn` | `decode` | 1100 | **4.40 ms** | SwiGLU FFN (Gate + Up + Down projections) |
-| ├── `layer:qkv_proj` | `decode` | 1100 | **0.64 ms** | Q, K, V projections |
-| ├── `layer:attn_out_proj` | `decode` | 1100 | **0.51 ms** | Attention output projection |
-| ├── `layer:mha` | `decode` | 1100 | **0.02 ms** | Multi-head attention (KV cache lookup & softmax) |
-| ├── `layer:rope` | `decode` | 1100 | **0.01 ms** | Rotary Position Embeddings |
-| └── `layer:attn_norm` | `decode` | 1100 | **0.002 ms** | RMSNorm |
-| `embedding_lookup` | `decode` | 50 | **20.34 ms** | Token embedding dequantization |
-| `final_norm_and_lm_head`| `decode` | 50 | **8.47 ms** | RMSNorm + Vocab projection (fused `Q6_K`) |
-| `decode:argmax` | `decode` | 50 | **0.02 ms** | Greedy token sampling |
+| `decode:forward_token` | `decode` | 200 | **65.39 ms** | Total per-token decode step |
+| `all_layers` | `decode` | 200 | **42.30 ms** | 22 transformer layers combined |
+| ├── `layer:ffn` | `decode` | 4400 | **1.32 ms** | SwiGLU FFN (Gate + Up + Down projections) |
+| ├── `layer:qkv_proj` | `decode` | 4400 | **0.32 ms** | Q, K, V projections |
+| ├── `layer:attn_out_proj` | `decode` | 4400 | **0.19 ms** | Attention output projection |
+| ├── `layer:mha` | `decode` | 4400 | **0.09 ms** | Multi-head attention (KV cache lookup & softmax) |
+| ├── `layer:rope` | `decode` | 4400 | **0.01 ms** | Rotary Position Embeddings |
+| └── `layer:attn_norm` | `decode` | 4400 | **0.002 ms** | RMSNorm |
+| `embedding_lookup` | `decode` | 200 | **20.69 ms** | Token embedding dequantization |
+| `final_norm_and_lm_head`| `decode` | 200 | **2.40 ms** | RMSNorm + Vocab projection (fused `Q6_K`) |
+| `decode:argmax` | `decode` | 200 | **0.02 ms** | Greedy token sampling |
 
 To reproduce these metrics on your machine:
 ```bash
-python3 benchmarks/run_bench.py path/to/tinyllama.gguf 20
+python3 benchmarks/run_bench.py path/to/tinyllama.gguf 200
 ```
 
 ---

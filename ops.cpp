@@ -2,6 +2,8 @@
 #include "dequant.h"
 #include <cmath>
 #include <cstring>
+#include <thread>
+#include <vector>
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -85,58 +87,78 @@ static void matvec_q8_0_impl(float *out, const void *W, const float *x, int n_ou
     const BlockQ8_0 *blocks = (const BlockQ8_0 *)W;
     int blocks_per_row = n_in / 32;
 
-    for (int i = 0; i < n_out; i++) {
-        const BlockQ8_0 *row = blocks + i * blocks_per_row;
-        float row_sum = 0.0f;
+    auto worker = [&](int row_start, int row_end) {
+        for (int i = row_start; i < row_end; i++) {
+            const BlockQ8_0 *row = blocks + i * blocks_per_row;
+            float row_sum = 0.0f;
 
-        for (int b = 0; b < blocks_per_row; b++) {
-            const float *x_block = x + b * 32;
-            float block_sum = 0.0f;
+            for (int b = 0; b < blocks_per_row; b++) {
+                const float *x_block = x + b * 32;
+                float block_sum = 0.0f;
 
-            if constexpr (Mode == DiagMode::MEM_ONLY) {
-                for (int j = 0; j < 32; j++) {
-                    block_sum += (float)row[b].quants[j];
-                }
-                row_sum += block_sum;
-            } else if constexpr (Mode == DiagMode::COMPUTE_2X) {
-                for (int j = 0; j < 32; j++) {
-                    float q = (float)row[b].quants[j];
-                    block_sum += q * x_block[j];
-                    block_sum += (q + 1.0f) * x_block[j];
-                }
-                row_sum += f16_to_f32(row[b].scale) * block_sum;
-            } else {
+                if constexpr (Mode == DiagMode::MEM_ONLY) {
+                    for (int j = 0; j < 32; j++) {
+                        block_sum += (float)row[b].quants[j];
+                    }
+                    row_sum += block_sum;
+                } else if constexpr (Mode == DiagMode::COMPUTE_2X) {
+                    for (int j = 0; j < 32; j++) {
+                        float q = (float)row[b].quants[j];
+                        block_sum += q * x_block[j];
+                        block_sum += (q + 1.0f) * x_block[j];
+                    }
+                    row_sum += f16_to_f32(row[b].scale) * block_sum;
+                } else {
 #if defined(__ARM_NEON)
-                float32x4_t acc0 = vdupq_n_f32(0.0f);
-                float32x4_t acc1 = vdupq_n_f32(0.0f);
+                    float32x4_t acc0 = vdupq_n_f32(0.0f);
+                    float32x4_t acc1 = vdupq_n_f32(0.0f);
 
-                for (int j = 0; j < 32; j += 8) {
-                    // Load 8 weights and widen to floats
-                    int8x8_t q8 = vld1_s8(&row[b].quants[j]);
-                    int16x8_t q16 = vmovl_s8(q8);
-                    float32x4_t qf_low  = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16)));
-                    float32x4_t qf_high = vcvtq_f32_s32(vmovl_high_s16(q16));
+                    for (int j = 0; j < 32; j += 8) {
+                        // Load 8 weights and widen to floats
+                        int8x8_t q8 = vld1_s8(&row[b].quants[j]);
+                        int16x8_t q16 = vmovl_s8(q8);
+                        float32x4_t qf_low  = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16)));
+                        float32x4_t qf_high = vcvtq_f32_s32(vmovl_high_s16(q16));
 
-                    // Load 8 activations
-                    float32x4_t x_low  = vld1q_f32(x_block + j);
-                    float32x4_t x_high = vld1q_f32(x_block + j + 4);
+                        // Load 8 activations
+                        float32x4_t x_low  = vld1q_f32(x_block + j);
+                        float32x4_t x_high = vld1q_f32(x_block + j + 4);
 
-                    // Fused multiply-accumulate on independent accumulators
-                    acc0 = vfmaq_f32(acc0, qf_low,  x_low);
-                    acc1 = vfmaq_f32(acc1, qf_high, x_high);
-                }
+                        // Fused multiply-accumulate on independent accumulators
+                        acc0 = vfmaq_f32(acc0, qf_low,  x_low);
+                        acc1 = vfmaq_f32(acc1, qf_high, x_high);
+                    }
 
-                block_sum = vaddvq_f32(vaddq_f32(acc0, acc1));
+                    block_sum = vaddvq_f32(vaddq_f32(acc0, acc1));
 #else
-                for (int j = 0; j < 32; j++) {
-                    block_sum += (float)row[b].quants[j] * x_block[j];
-                }
+                    for (int j = 0; j < 32; j++) {
+                        block_sum += (float)row[b].quants[j] * x_block[j];
+                    }
 #endif
-                row_sum += f16_to_f32(row[b].scale) * block_sum;
+                    row_sum += f16_to_f32(row[b].scale) * block_sum;
+                }
             }
-        }
 
-        out[i] = row_sum;
+            out[i] = row_sum;
+        }
+    };
+
+    const int n_threads = (n_out >= 64) ? 4 : 1;
+    if (n_threads == 1) {
+        worker(0, n_out);
+    } else {
+        std::vector<std::thread> workers;
+        workers.reserve(n_threads);
+        int chunk_size = n_out / n_threads;
+
+        for (int t = 0; t < n_threads; t++) {
+            int r_start = t * chunk_size;
+            int r_end   = (t == n_threads - 1) ? n_out : r_start + chunk_size;
+            workers.emplace_back(worker, r_start, r_end);
+        }
+        for (auto &w : workers) {
+            w.join();
+        }
     }
 }
 
@@ -158,142 +180,163 @@ static void matvec_q4_k_impl(float *out, const void *W, const float *x, int n_ou
     const BlockQ4_K *blocks = (const BlockQ4_K *)W;
     int blocks_per_row = n_in / 256;
 
-    for (int i = 0; i < n_out; i++) {
-        const BlockQ4_K *row = blocks + i * blocks_per_row;
-        float row_sum = 0.0f;
+    auto worker = [&](int row_start, int row_end) {
+        for (int i = row_start; i < row_end; i++) {
+            const BlockQ4_K *row = blocks + i * blocks_per_row;
+            float row_sum = 0.0f;
 
-        for (int b = 0; b < blocks_per_row; b++) {
-            const BlockQ4_K *block = &row[b];
-            const float *x_super = x + b * 256;
-            const uint8_t *q = block->quants;
+            for (int b = 0; b < blocks_per_row; b++) {
+                const BlockQ4_K *block = &row[b];
+                const float *x_super = x + b * 256;
+                const uint8_t *q = block->quants;
 
-            float d    = f16_to_f32(block->d);
-            float dmin = f16_to_f32(block->dmin);
+                float d    = f16_to_f32(block->d);
+                float dmin = f16_to_f32(block->dmin);
 
-            int sub_block = 0;
-            for (int chunk = 0; chunk < 256; chunk += 64) {
-                // sub-block 1: low nibble
-                uint8_t sc1, m1_raw;
-                get_scale_min_k4(sub_block, block->scales, &sc1, &m1_raw);
-                float d1 = d * sc1;
-                float m1 = dmin * m1_raw;
+                int sub_block = 0;
+                for (int chunk = 0; chunk < 256; chunk += 64) {
+                    // sub-block 1: low nibble
+                    uint8_t sc1, m1_raw;
+                    get_scale_min_k4(sub_block, block->scales, &sc1, &m1_raw);
+                    float d1 = d * sc1;
+                    float m1 = dmin * m1_raw;
 
-                // sub-block 2: high nibble
-                uint8_t sc2, m2_raw;
-                get_scale_min_k4(sub_block + 1, block->scales, &sc2, &m2_raw);
-                float d2 = d * sc2;
-                float m2 = dmin * m2_raw;
+                    // sub-block 2: high nibble
+                    uint8_t sc2, m2_raw;
+                    get_scale_min_k4(sub_block + 1, block->scales, &sc2, &m2_raw);
+                    float d2 = d * sc2;
+                    float m2 = dmin * m2_raw;
 
-                const float *x_sub1 = x_super + chunk;
-                const float *x_sub2 = x_super + chunk + 32;
+                    const float *x_sub1 = x_super + chunk;
+                    const float *x_sub2 = x_super + chunk + 32;
 
-                if constexpr (Mode == DiagMode::MEM_ONLY) {
-                    uint32_t q_sum = 0;
-                    for (int l = 0; l < 32; l++) {
-                        q_sum += q[l];
-                    }
-                    row_sum += (float)(q_sum * 2);
-                } else if constexpr (Mode == DiagMode::COMPUTE_2X) {
-                    float q_sum1 = 0.0f;
-                    float x_sum1 = 0.0f;
-                    for (int l = 0; l < 32; l++) {
-                        float q_val = (float)(q[l] & 0xF);
-                        float x_val = x_sub1[l];
-                        q_sum1 += q_val * x_val;
-                        q_sum1 += (q_val + 1.0f) * x_val;
-                        x_sum1 += x_val;
-                    }
-                    row_sum += d1 * q_sum1 - m1 * x_sum1;
+                    if constexpr (Mode == DiagMode::MEM_ONLY) {
+                        uint32_t q_sum = 0;
+                        for (int l = 0; l < 32; l++) {
+                            q_sum += q[l];
+                        }
+                        row_sum += (float)(q_sum * 2);
+                    } else if constexpr (Mode == DiagMode::COMPUTE_2X) {
+                        float q_sum1 = 0.0f;
+                        float x_sum1 = 0.0f;
+                        for (int l = 0; l < 32; l++) {
+                            float q_val = (float)(q[l] & 0xF);
+                            float x_val = x_sub1[l];
+                            q_sum1 += q_val * x_val;
+                            q_sum1 += (q_val + 1.0f) * x_val;
+                            x_sum1 += x_val;
+                        }
+                        row_sum += d1 * q_sum1 - m1 * x_sum1;
 
-                    float q_sum2 = 0.0f;
-                    float x_sum2 = 0.0f;
-                    for (int l = 0; l < 32; l++) {
-                        float q_val = (float)(q[l] >> 4);
-                        float x_val = x_sub2[l];
-                        q_sum2 += q_val * x_val;
-                        q_sum2 += (q_val + 1.0f) * x_val;
-                        x_sum2 += x_val;
-                    }
-                    row_sum += d2 * q_sum2 - m2 * x_sum2;
-                } else {
+                        float q_sum2 = 0.0f;
+                        float x_sum2 = 0.0f;
+                        for (int l = 0; l < 32; l++) {
+                            float q_val = (float)(q[l] >> 4);
+                            float x_val = x_sub2[l];
+                            q_sum2 += q_val * x_val;
+                            q_sum2 += (q_val + 1.0f) * x_val;
+                            x_sum2 += x_val;
+                        }
+                        row_sum += d2 * q_sum2 - m2 * x_sum2;
+                    } else {
 #if defined(__ARM_NEON)
-                    // Multi-accumulators: 2 independent accumulators per stream
-                    float32x4_t acc_q1_0 = vdupq_n_f32(0.0f);
-                    float32x4_t acc_q1_1 = vdupq_n_f32(0.0f);
-                    float32x4_t acc_x1_0 = vdupq_n_f32(0.0f);
-                    float32x4_t acc_x1_1 = vdupq_n_f32(0.0f);
+                        // Multi-accumulators: 2 independent accumulators per stream
+                        float32x4_t acc_q1_0 = vdupq_n_f32(0.0f);
+                        float32x4_t acc_q1_1 = vdupq_n_f32(0.0f);
+                        float32x4_t acc_x1_0 = vdupq_n_f32(0.0f);
+                        float32x4_t acc_x1_1 = vdupq_n_f32(0.0f);
 
-                    float32x4_t acc_q2_0 = vdupq_n_f32(0.0f);
-                    float32x4_t acc_q2_1 = vdupq_n_f32(0.0f);
-                    float32x4_t acc_x2_0 = vdupq_n_f32(0.0f);
-                    float32x4_t acc_x2_1 = vdupq_n_f32(0.0f);
+                        float32x4_t acc_q2_0 = vdupq_n_f32(0.0f);
+                        float32x4_t acc_q2_1 = vdupq_n_f32(0.0f);
+                        float32x4_t acc_x2_0 = vdupq_n_f32(0.0f);
+                        float32x4_t acc_x2_1 = vdupq_n_f32(0.0f);
 
-                    uint8x8_t mask = vdup_n_u8(0x0F);
+                        uint8x8_t mask = vdup_n_u8(0x0F);
 
-                    for (int l = 0; l < 32; l += 8) {
-                        uint8x8_t bytes = vld1_u8(q + l);
-                        uint8x8_t q1_u8 = vand_u8(bytes, mask);
-                        uint8x8_t q2_u8 = vshr_n_u8(bytes, 4);
+                        for (int l = 0; l < 32; l += 8) {
+                            uint8x8_t bytes = vld1_u8(q + l);
+                            uint8x8_t q1_u8 = vand_u8(bytes, mask);
+                            uint8x8_t q2_u8 = vshr_n_u8(bytes, 4);
 
-                        // ── Sub-block 1 ──
-                        uint16x8_t q1_16  = vmovl_u8(q1_u8);
-                        float32x4_t q1_f0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(q1_16)));
-                        float32x4_t q1_f1 = vcvtq_f32_u32(vmovl_high_u16(q1_16));
+                            // ── Sub-block 1 ──
+                            uint16x8_t q1_16  = vmovl_u8(q1_u8);
+                            float32x4_t q1_f0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(q1_16)));
+                            float32x4_t q1_f1 = vcvtq_f32_u32(vmovl_high_u16(q1_16));
 
-                        float32x4_t x1_0  = vld1q_f32(x_sub1 + l);
-                        float32x4_t x1_1  = vld1q_f32(x_sub1 + l + 4);
+                            float32x4_t x1_0  = vld1q_f32(x_sub1 + l);
+                            float32x4_t x1_1  = vld1q_f32(x_sub1 + l + 4);
 
-                        acc_q1_0 = vfmaq_f32(acc_q1_0, q1_f0, x1_0);
-                        acc_q1_1 = vfmaq_f32(acc_q1_1, q1_f1, x1_1);
-                        acc_x1_0 = vaddq_f32(acc_x1_0, x1_0);
-                        acc_x1_1 = vaddq_f32(acc_x1_1, x1_1);
+                            acc_q1_0 = vfmaq_f32(acc_q1_0, q1_f0, x1_0);
+                            acc_q1_1 = vfmaq_f32(acc_q1_1, q1_f1, x1_1);
+                            acc_x1_0 = vaddq_f32(acc_x1_0, x1_0);
+                            acc_x1_1 = vaddq_f32(acc_x1_1, x1_1);
 
-                        // ── Sub-block 2 ──
-                        uint16x8_t q2_16  = vmovl_u8(q2_u8);
-                        float32x4_t q2_f0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(q2_16)));
-                        float32x4_t q2_f1 = vcvtq_f32_u32(vmovl_high_u16(q2_16));
+                            // ── Sub-block 2 ──
+                            uint16x8_t q2_16  = vmovl_u8(q2_u8);
+                            float32x4_t q2_f0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(q2_16)));
+                            float32x4_t q2_f1 = vcvtq_f32_u32(vmovl_high_u16(q2_16));
 
-                        float32x4_t x2_0  = vld1q_f32(x_sub2 + l);
-                        float32x4_t x2_1  = vld1q_f32(x_sub2 + l + 4);
+                            float32x4_t x2_0  = vld1q_f32(x_sub2 + l);
+                            float32x4_t x2_1  = vld1q_f32(x_sub2 + l + 4);
 
-                        acc_q2_0 = vfmaq_f32(acc_q2_0, q2_f0, x2_0);
-                        acc_q2_1 = vfmaq_f32(acc_q2_1, q2_f1, x2_1);
-                        acc_x2_0 = vaddq_f32(acc_x2_0, x2_0);
-                        acc_x2_1 = vaddq_f32(acc_x2_1, x2_1);
-                    }
+                            acc_q2_0 = vfmaq_f32(acc_q2_0, q2_f0, x2_0);
+                            acc_q2_1 = vfmaq_f32(acc_q2_1, q2_f1, x2_1);
+                            acc_x2_0 = vaddq_f32(acc_x2_0, x2_0);
+                            acc_x2_1 = vaddq_f32(acc_x2_1, x2_1);
+                        }
 
-                    // Combine interleaved accumulators
-                    float q_sum1 = vaddvq_f32(vaddq_f32(acc_q1_0, acc_q1_1));
-                    float x_sum1 = vaddvq_f32(vaddq_f32(acc_x1_0, acc_x1_1));
-                    float q_sum2 = vaddvq_f32(vaddq_f32(acc_q2_0, acc_q2_1));
-                    float x_sum2 = vaddvq_f32(vaddq_f32(acc_x2_0, acc_x2_1));
+                        // Combine interleaved accumulators
+                        float q_sum1 = vaddvq_f32(vaddq_f32(acc_q1_0, acc_q1_1));
+                        float x_sum1 = vaddvq_f32(vaddq_f32(acc_x1_0, acc_x1_1));
+                        float q_sum2 = vaddvq_f32(vaddq_f32(acc_q2_0, acc_q2_1));
+                        float x_sum2 = vaddvq_f32(vaddq_f32(acc_x2_0, acc_x2_1));
 
-                    row_sum += (d1 * q_sum1 - m1 * x_sum1) + (d2 * q_sum2 - m2 * x_sum2);
+                        row_sum += (d1 * q_sum1 - m1 * x_sum1) + (d2 * q_sum2 - m2 * x_sum2);
 #else
-                    float q_sum1 = 0.0f;
-                    float x_sum1 = 0.0f;
-                    for (int l = 0; l < 32; l++) {
-                        q_sum1 += (float)(q[l] & 0xF) * x_sub1[l];
-                        x_sum1 += x_sub1[l];
-                    }
-                    row_sum += d1 * q_sum1 - m1 * x_sum1;
+                        float q_sum1 = 0.0f;
+                        float x_sum1 = 0.0f;
+                        for (int l = 0; l < 32; l++) {
+                            q_sum1 += (float)(q[l] & 0xF) * x_sub1[l];
+                            x_sum1 += x_sub1[l];
+                        }
+                        row_sum += d1 * q_sum1 - m1 * x_sum1;
 
-                    float q_sum2 = 0.0f;
-                    float x_sum2 = 0.0f;
-                    for (int l = 0; l < 32; l++) {
-                        q_sum2 += (float)(q[l] >> 4) * x_sub2[l];
-                        x_sum2 += x_sub2[l];
-                    }
-                    row_sum += d2 * q_sum2 - m2 * x_sum2;
+                        float q_sum2 = 0.0f;
+                        float x_sum2 = 0.0f;
+                        for (int l = 0; l < 32; l++) {
+                            q_sum2 += (float)(q[l] >> 4) * x_sub2[l];
+                            x_sum2 += x_sub2[l];
+                        }
+                        row_sum += d2 * q_sum2 - m2 * x_sum2;
 #endif
+                    }
+
+                    q += 32;
+                    sub_block += 2;
                 }
-
-                q += 32;
-                sub_block += 2;
             }
-        }
 
-        out[i] = row_sum;
+            out[i] = row_sum;
+        }
+    };
+
+    // Determine thread count (default 4 if rows >= 64, else single thread)
+    const int n_threads = (n_out >= 64) ? 4 : 1;
+    if (n_threads == 1) {
+        worker(0, n_out);
+    } else {
+        std::vector<std::thread> workers;
+        workers.reserve(n_threads);
+        int chunk_size = n_out / n_threads;
+
+        for (int t = 0; t < n_threads; t++) {
+            int r_start = t * chunk_size;
+            int r_end   = (t == n_threads - 1) ? n_out : r_start + chunk_size;
+            workers.emplace_back(worker, r_start, r_end);
+        }
+        for (auto &w : workers) {
+            w.join();
+        }
     }
 }
 
@@ -315,100 +358,120 @@ static void matvec_q6_k_impl(float *out, const void *W, const float *x, int n_ou
     const BlockQ6_K *blocks = (const BlockQ6_K *)W;
     int blocks_per_row = n_in / 256;
 
-    for (int i = 0; i < n_out; i++) {
-        const BlockQ6_K *row = blocks + i * blocks_per_row;
-        float row_sum = 0.0f;
+    auto worker = [&](int row_start, int row_end) {
+        for (int i = row_start; i < row_end; i++) {
+            const BlockQ6_K *row = blocks + i * blocks_per_row;
+            float row_sum = 0.0f;
 
-        for (int b = 0; b < blocks_per_row; b++) {
-            const BlockQ6_K *block = &row[b];
-            float d = f16_to_f32(block->d);
+            for (int b = 0; b < blocks_per_row; b++) {
+                const BlockQ6_K *block = &row[b];
+                float d = f16_to_f32(block->d);
 
-            const uint8_t *ql = block->ql;
-            const uint8_t *qh = block->qh;
-            const int8_t  *sc = block->scales;
-            const float   *x_block = x + b * 256;
+                const uint8_t *ql = block->ql;
+                const uint8_t *qh = block->qh;
+                const int8_t  *sc = block->scales;
+                const float   *x_block = x + b * 256;
 
-            float block_sum = 0.0f;
+                float block_sum = 0.0f;
 
-            for (int half = 0; half < 2; half++) {
-                const float *x_half = x_block + half * 128;
+                for (int half = 0; half < 2; half++) {
+                    const float *x_half = x_block + half * 128;
 
 #if defined(__ARM_NEON)
-                float32x4_t acc0 = vdupq_n_f32(0.0f);
-                float32x4_t acc1 = vdupq_n_f32(0.0f);
+                    float32x4_t acc0 = vdupq_n_f32(0.0f);
+                    float32x4_t acc1 = vdupq_n_f32(0.0f);
 
-                uint8x8_t mask_0f = vdup_n_u8(0x0F);
-                uint8x8_t mask_03 = vdup_n_u8(0x03);
-                uint8x8_t c32     = vdup_n_u8(32);
+                    uint8x8_t mask_0f = vdup_n_u8(0x0F);
+                    uint8x8_t mask_03 = vdup_n_u8(0x03);
+                    uint8x8_t c32     = vdup_n_u8(32);
 
-                for (int l = 0; l < 32; l += 8) {
-                    int is = l / 16;
+                    for (int l = 0; l < 32; l += 8) {
+                        int is = l / 16;
 
-                    // 1. Load 8 bytes each of ql and qh
-                    uint8x8_t ql_a = vld1_u8(ql + l);
-                    uint8x8_t ql_b = vld1_u8(ql + l + 32);
-                    uint8x8_t qh_v = vld1_u8(qh + l);
+                        // 1. Load 8 bytes each of ql and qh
+                        uint8x8_t ql_a = vld1_u8(ql + l);
+                        uint8x8_t ql_b = vld1_u8(ql + l + 32);
+                        uint8x8_t qh_v = vld1_u8(qh + l);
 
-                    // 2. Extract 4-bit low nibbles
-                    uint8x8_t q1_low = vand_u8(ql_a, mask_0f);
-                    uint8x8_t q2_low = vand_u8(ql_b, mask_0f);
-                    uint8x8_t q3_low = vshr_n_u8(ql_a, 4);
-                    uint8x8_t q4_low = vshr_n_u8(ql_b, 4);
+                        // 2. Extract 4-bit low nibbles
+                        uint8x8_t q1_low = vand_u8(ql_a, mask_0f);
+                        uint8x8_t q2_low = vand_u8(ql_b, mask_0f);
+                        uint8x8_t q3_low = vshr_n_u8(ql_a, 4);
+                        uint8x8_t q4_low = vshr_n_u8(ql_b, 4);
 
-                    // 3. Extract 2-bit high slices and shift to bits 4..5
-                    uint8x8_t q1_high = vshl_n_u8(vand_u8(qh_v, mask_03), 4);
-                    uint8x8_t q2_high = vshl_n_u8(vand_u8(vshr_n_u8(qh_v, 2), mask_03), 4);
-                    uint8x8_t q3_high = vshl_n_u8(vand_u8(vshr_n_u8(qh_v, 4), mask_03), 4);
-                    uint8x8_t q4_high = vshl_n_u8(vshr_n_u8(qh_v, 6), 4);
+                        // 3. Extract 2-bit high slices and shift to bits 4..5
+                        uint8x8_t q1_high = vshl_n_u8(vand_u8(qh_v, mask_03), 4);
+                        uint8x8_t q2_high = vshl_n_u8(vand_u8(vshr_n_u8(qh_v, 2), mask_03), 4);
+                        uint8x8_t q3_high = vshl_n_u8(vand_u8(vshr_n_u8(qh_v, 4), mask_03), 4);
+                        uint8x8_t q4_high = vshl_n_u8(vshr_n_u8(qh_v, 6), 4);
 
-                    // 4. Combine into 6-bit values and subtract 32 -> signed int8 [-32..+31]
-                    int8x8_t q1_s8 = vsub_s8(vreinterpret_s8_u8(vorr_u8(q1_low, q1_high)), vreinterpret_s8_u8(c32));
-                    int8x8_t q2_s8 = vsub_s8(vreinterpret_s8_u8(vorr_u8(q2_low, q2_high)), vreinterpret_s8_u8(c32));
-                    int8x8_t q3_s8 = vsub_s8(vreinterpret_s8_u8(vorr_u8(q3_low, q3_high)), vreinterpret_s8_u8(c32));
-                    int8x8_t q4_s8 = vsub_s8(vreinterpret_s8_u8(vorr_u8(q4_low, q4_high)), vreinterpret_s8_u8(c32));
+                        // 4. Combine into 6-bit values and subtract 32 -> signed int8 [-32..+31]
+                        int8x8_t q1_s8 = vsub_s8(vreinterpret_s8_u8(vorr_u8(q1_low, q1_high)), vreinterpret_s8_u8(c32));
+                        int8x8_t q2_s8 = vsub_s8(vreinterpret_s8_u8(vorr_u8(q2_low, q2_high)), vreinterpret_s8_u8(c32));
+                        int8x8_t q3_s8 = vsub_s8(vreinterpret_s8_u8(vorr_u8(q3_low, q3_high)), vreinterpret_s8_u8(c32));
+                        int8x8_t q4_s8 = vsub_s8(vreinterpret_s8_u8(vorr_u8(q4_low, q4_high)), vreinterpret_s8_u8(c32));
 
-                    // Helper lambda using 2 independent accumulators
-                    auto fma_scaled = [&](int8x8_t q_vec, float scale, const float *x_ptr) {
-                        int16x8_t q16 = vmovl_s8(q_vec);
-                        float32x4_t qf0 = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16))), scale);
-                        float32x4_t qf1 = vmulq_n_f32(vcvtq_f32_s32(vmovl_high_s16(q16)), scale);
+                        // Helper lambda using 2 independent accumulators
+                        auto fma_scaled = [&](int8x8_t q_vec, float scale, const float *x_ptr) {
+                            int16x8_t q16 = vmovl_s8(q_vec);
+                            float32x4_t qf0 = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16))), scale);
+                            float32x4_t qf1 = vmulq_n_f32(vcvtq_f32_s32(vmovl_high_s16(q16)), scale);
 
-                        acc0 = vfmaq_f32(acc0, qf0, vld1q_f32(x_ptr));
-                        acc1 = vfmaq_f32(acc1, qf1, vld1q_f32(x_ptr + 4));
-                    };
+                            acc0 = vfmaq_f32(acc0, qf0, vld1q_f32(x_ptr));
+                            acc1 = vfmaq_f32(acc1, qf1, vld1q_f32(x_ptr + 4));
+                        };
 
-                    fma_scaled(q1_s8, (float)sc[is + 0], x_half + l +  0);
-                    fma_scaled(q2_s8, (float)sc[is + 2], x_half + l + 32);
-                    fma_scaled(q3_s8, (float)sc[is + 4], x_half + l + 64);
-                    fma_scaled(q4_s8, (float)sc[is + 6], x_half + l + 96);
-                }
+                        fma_scaled(q1_s8, (float)sc[is + 0], x_half + l +  0);
+                        fma_scaled(q2_s8, (float)sc[is + 2], x_half + l + 32);
+                        fma_scaled(q3_s8, (float)sc[is + 4], x_half + l + 64);
+                        fma_scaled(q4_s8, (float)sc[is + 6], x_half + l + 96);
+                    }
 
-                block_sum += vaddvq_f32(vaddq_f32(acc0, acc1));
+                    block_sum += vaddvq_f32(vaddq_f32(acc0, acc1));
 #else
-                for (int l = 0; l < 32; l++) {
-                    int is = l / 16;
+                    for (int l = 0; l < 32; l++) {
+                        int is = l / 16;
 
-                    int8_t q1 = (int8_t)((ql[l]      & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
-                    int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
-                    int8_t q3 = (int8_t)((ql[l]      >> 4)  | (((qh[l] >> 4) & 3) << 4)) - 32;
-                    int8_t q4 = (int8_t)((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4)) - 32;
+                        int8_t q1 = (int8_t)((ql[l]      & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                        int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                        int8_t q3 = (int8_t)((ql[l]      >> 4)  | (((qh[l] >> 4) & 3) << 4)) - 32;
+                        int8_t q4 = (int8_t)((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4)) - 32;
 
-                    block_sum += (float)q1 * x_half[l +  0] * (float)sc[is + 0];
-                    block_sum += (float)q2 * x_half[l + 32] * (float)sc[is + 2];
-                    block_sum += (float)q3 * x_half[l + 64] * (float)sc[is + 4];
-                    block_sum += (float)q4 * x_half[l + 96] * (float)sc[is + 6];
-                }
+                        block_sum += (float)q1 * x_half[l +  0] * (float)sc[is + 0];
+                        block_sum += (float)q2 * x_half[l + 32] * (float)sc[is + 2];
+                        block_sum += (float)q3 * x_half[l + 64] * (float)sc[is + 4];
+                        block_sum += (float)q4 * x_half[l + 96] * (float)sc[is + 6];
+                    }
 #endif
 
-                ql += 64;
-                qh += 32;
-                sc += 8;
+                    ql += 64;
+                    qh += 32;
+                    sc += 8;
+                }
+
+                row_sum += d * block_sum;
             }
 
-            row_sum += d * block_sum;
+            out[i] = row_sum;
         }
+    };
 
-        out[i] = row_sum;
+    const int n_threads = (n_out >= 64) ? 4 : 1;
+    if (n_threads == 1) {
+        worker(0, n_out);
+    } else {
+        std::vector<std::thread> workers;
+        workers.reserve(n_threads);
+        int chunk_size = n_out / n_threads;
+
+        for (int t = 0; t < n_threads; t++) {
+            int r_start = t * chunk_size;
+            int r_end   = (t == n_threads - 1) ? n_out : r_start + chunk_size;
+            workers.emplace_back(worker, r_start, r_end);
+        }
+        for (auto &w : workers) {
+            w.join();
+        }
     }
 }
 
