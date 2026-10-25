@@ -91,4 +91,8 @@ void dequantize_q6_k(const void *src, float *dst, size_t n_elements);
 // Returns false if the type is unsupported.
 bool dequantize(const void *src, float *dst, size_t n_elements, GGMLType type);
 
+// Byte size of one row of n_cols elements stored in `type`.
+// Returns 0 if the type is unsupported or n_cols isn't a whole number of blocks.
+size_t row_bytes(GGMLType type, size_t n_cols);
+
 #endif // DEQUANT_H

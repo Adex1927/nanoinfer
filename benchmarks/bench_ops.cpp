@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #include <vector>
 
 struct BenchResult {
@@ -68,8 +69,37 @@ static BenchResult benchmark_layer(const char *name, int n_out, int n_in, int it
     return {t_normal, t_mem, t_compute, bw, flops};
 }
 
+// Measures the fixed cost each matvec pays today: spawn N threads, join N threads.
+// The lambda is empty, so any time measured is pure threading overhead.
+static void benchmark_thread_spawn(int n_threads, int iters = 1000) {
+    printf("Benchmarking thread spawn+join (%d threads, %d iters)...\n", n_threads, iters);
+
+    std::vector<std::thread> workers;
+    workers.reserve(n_threads);
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iters; i++) {
+        for (int t = 0; t < n_threads; t++) workers.emplace_back([] {});
+        for (auto &w : workers) w.join();
+        workers.clear();
+    }
+    auto t1 = std::chrono::high_resolution_clock::now();
+
+    double us_per_call = std::chrono::duration<double, std::micro>(t1 - t0).count() / iters;
+
+    // TinyLlama: 22 layers x 7 matvecs (q,k,v,o,gate,up,down) + 1 lm_head
+    const int matvecs_per_token = 22 * 7 + 1;
+    double ms_per_token = us_per_call * matvecs_per_token / 1000.0;
+
+    printf("  Per matvec call: %7.2f us\n", us_per_call);
+    printf("  Per token (x%d): %7.2f ms\n\n", matvecs_per_token, ms_per_token);
+}
+
 int main() {
     printf("=== nanoinfer Quantized GEMV (Q4_K) Diagnostic Benchmark ===\n\n");
+
+    // 0. Threading overhead (what every matvec pays before doing any math)
+    benchmark_thread_spawn(4);
 
     // 1. Attention Projection: 2048 x 2048
     benchmark_layer("Attention Output (attn_output)", 2048, 2048);

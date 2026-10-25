@@ -8,7 +8,7 @@ Prints a text table and saves one figure with four plain panels:
   1. decode step latency vs token position   (trend / outliers)
   2. share of a decode step by stage         (what to optimize)
   3. mean time per layer, per stage          (are any layers odd?)
-  4. attention time vs context length        (O(pos) growth of mha)
+  4. per-token time of every stage vs context  (which ops grow with pos?)
 
 Usage:
   python3 tools/plot_probe.py                    # reads probe.csv -> probe.png
@@ -102,18 +102,24 @@ def main():
     ax[2].set_ylabel("ms")
     ax[2].legend(fontsize=7)
 
-    # 4. attention time vs context length (mean over layers, per token position)
-    mha = dec[dec.name == "layer:mha"].groupby("token_pos").ms.mean() * 1000  # us
-    if len(mha) > 1:
-        ax[3].plot(mha.index, mha.values, marker=".", lw=1, label="measured")
-        slope, icpt = np.polyfit(mha.index, mha.values, 1)
-        ax[3].plot(mha.index, slope * mha.index + icpt, "--", color="gray",
-                   label=f"fit: {slope:.2f} us/token")
-        ax[3].legend()
-    ax[3].set_title("Attention (mha) time vs context length")
+    # 4. per-token time of every stage vs context length
+    #    (layer stages summed over layers, same units as panel 2).
+    #    Legend shows each stage's linear-fit slope: a stage that scales
+    #    with context (e.g. mha) has a clearly positive slope.
+    if len(bd) > 1:
+        x = bd.index.values
+        for st in bd.mean().sort_values(ascending=False).index:
+            y = bd[st].values
+            if not (y > 0).any():
+                continue
+            slope_us = np.polyfit(x, y, 1)[0] * 1000  # ms/pos -> us/pos
+            label = st.replace("layer:", "")
+            ax[3].plot(x, y, lw=1, label=f"{label} ({slope_us:+.2f} us/pos)")
+        ax[3].set_yscale("log")
+        ax[3].legend(fontsize=7)
+    ax[3].set_title("Per-token stage time vs context length (log scale)")
     ax[3].set_xlabel("token position (context length - 1)")
-    ax[3].set_ylabel("us per layer call")
-    ax[3].set_ylim(bottom=0)
+    ax[3].set_ylabel("ms per token (summed over layers)")
 
     fig.tight_layout()
     fig.savefig(args.out, dpi=120)

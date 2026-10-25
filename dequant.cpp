@@ -213,3 +213,24 @@ bool dequantize(const void *src, float *dst, size_t n_elements, GGMLType type) {
             return false;
     }
 }
+
+// ── row size helper ──
+
+size_t row_bytes(GGMLType type, size_t n_cols) {
+    switch (type) {
+        case GGML_TYPE_F32:
+            return n_cols * sizeof(float);
+
+        case GGML_TYPE_Q8_0:   // 32 weights per block
+            return (n_cols % 32 == 0) ? (n_cols / 32) * sizeof(BlockQ8_0) : 0;
+
+        case GGML_TYPE_Q4_K:   // 256 weights per super-block
+            return (n_cols % 256 == 0) ? (n_cols / 256) * sizeof(BlockQ4_K) : 0;
+
+        case GGML_TYPE_Q6_K:   // 256 weights per super-block
+            return (n_cols % 256 == 0) ? (n_cols / 256) * sizeof(BlockQ6_K) : 0;
+
+        default:
+            return 0;
+    }
+}

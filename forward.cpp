@@ -250,16 +250,17 @@ void forward_token(LlamaModel *llama, InferState *s, int token, int pos, bool ne
     int n_embd = s->n_embd;
     probe_set_pos(pos);
 
-    // 1. Embedding lookup: read token embedding into residual stream s->x
+    // 1. Embedding lookup: dequantize only row `token` straight into s->x
     {
         Probe p("embedding_lookup");
         TensorInfo *embd_info = llama->token_embd;
-        uint64_t n = 1;
-        for (uint32_t d = 0; d < embd_info->n_dims; d++) n *= embd_info->dims[d];
-        float *embd = (float *)calloc(n, sizeof(float));
-        dequantize(get_tensor_data(llama->model, embd_info->name), embd, n, embd_info->type);
-        memcpy(s->x, embd + token * n_embd, n_embd * sizeof(float));
-        free(embd);
+        size_t stride = row_bytes(embd_info->type, n_embd);
+        if (stride == 0) {
+            fprintf(stderr, "ERROR: unsupported token_embd type %u\n", (unsigned)embd_info->type);
+            exit(1);
+        }
+        const uint8_t *base = (const uint8_t *)get_tensor_data(llama->model, embd_info->name);
+        dequantize(base + (size_t)token * stride, s->x, n_embd, embd_info->type);
     }
 
     // 2. Transformer layers (accumulates K & V into cache at position `pos`)
