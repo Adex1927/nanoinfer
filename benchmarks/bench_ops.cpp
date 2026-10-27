@@ -1,5 +1,6 @@
 #include "ops.h"
 #include "dequant.h"
+#include "thread_pool.h"
 
 #include <chrono>
 #include <cmath>
@@ -95,11 +96,33 @@ static void benchmark_thread_spawn(int n_threads, int iters = 1000) {
     printf("  Per token (x%d): %7.2f ms\n\n", matvecs_per_token, ms_per_token);
 }
 
+// Measures persistent ThreadPool dispatch overhead with an empty worker lambda
+static void benchmark_pool_dispatch(int iters = 1000) {
+    printf("Benchmarking persistent ThreadPool dispatch (%d iters)...\n", iters);
+
+    // Warm-up pool
+    parallel_rows(2048, [](int, int) {});
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iters; i++) {
+        parallel_rows(2048, [](int, int) {});
+    }
+    auto t1 = std::chrono::high_resolution_clock::now();
+
+    double us_per_call = std::chrono::duration<double, std::micro>(t1 - t0).count() / iters;
+    const int matvecs_per_token = 22 * 7 + 1;
+    double ms_per_token = us_per_call * matvecs_per_token / 1000.0;
+
+    printf("  Per matvec call: %7.2f us\n", us_per_call);
+    printf("  Per token (x%d): %7.2f ms\n\n", matvecs_per_token, ms_per_token);
+}
+
 int main() {
     printf("=== nanoinfer Quantized GEMV (Q4_K) Diagnostic Benchmark ===\n\n");
 
-    // 0. Threading overhead (what every matvec pays before doing any math)
+    // 0. Threading overhead comparison
     benchmark_thread_spawn(4);
+    benchmark_pool_dispatch();
 
     // 1. Attention Projection: 2048 x 2048
     benchmark_layer("Attention Output (attn_output)", 2048, 2048);

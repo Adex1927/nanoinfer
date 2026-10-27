@@ -4,7 +4,7 @@ CXXFLAGS := -std=c++17 -Wall -Wextra -O3
 
 # Target binary name and source files
 TARGET   := model_test
-SRCS     := model_test.cpp llama_model.cpp model_loader.cpp dequant.cpp ops.cpp infer_state.cpp forward.cpp tokenizer.cpp
+SRCS     := model_test.cpp llama_model.cpp model_loader.cpp dequant.cpp ops.cpp thread_pool.cpp infer_state.cpp forward.cpp tokenizer.cpp
 
 # Default rule: built when you just type `make`
 all: $(TARGET)
@@ -14,11 +14,11 @@ $(TARGET): $(SRCS)
 	$(CXX) $(CXXFLAGS) -o $(TARGET) $(SRCS)
 
 # Unit tests
-test_ops: tests/test_ops.cpp ops.cpp dequant.cpp
+test_ops: tests/test_ops.cpp ops.cpp dequant.cpp thread_pool.cpp
 	$(CXX) $(CXXFLAGS) -I. -o $@ $^
 
 # Benchmarks
-bench_ops: benchmarks/bench_ops.cpp ops.cpp dequant.cpp
+bench_ops: benchmarks/bench_ops.cpp ops.cpp dequant.cpp thread_pool.cpp
 	$(CXX) $(CXXFLAGS) -I. -o $@ $^
 
 bench: bench_ops

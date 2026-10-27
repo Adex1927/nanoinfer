@@ -1,9 +1,8 @@
 #include "ops.h"
 #include "dequant.h"
+#include "thread_pool.h"
 #include <cmath>
 #include <cstring>
-#include <thread>
-#include <vector>
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -143,23 +142,7 @@ static void matvec_q8_0_impl(float *out, const void *W, const float *x, int n_ou
         }
     };
 
-    const int n_threads = (n_out >= 64) ? 4 : 1;
-    if (n_threads == 1) {
-        worker(0, n_out);
-    } else {
-        std::vector<std::thread> workers;
-        workers.reserve(n_threads);
-        int chunk_size = n_out / n_threads;
-
-        for (int t = 0; t < n_threads; t++) {
-            int r_start = t * chunk_size;
-            int r_end   = (t == n_threads - 1) ? n_out : r_start + chunk_size;
-            workers.emplace_back(worker, r_start, r_end);
-        }
-        for (auto &w : workers) {
-            w.join();
-        }
-    }
+    parallel_rows(n_out, worker);
 }
 
 void matvec_q8_0_diag(float *out, const void *W, const float *x, int n_out, int n_in, DiagMode mode) {
@@ -320,24 +303,7 @@ static void matvec_q4_k_impl(float *out, const void *W, const float *x, int n_ou
         }
     };
 
-    // Determine thread count (default 4 if rows >= 64, else single thread)
-    const int n_threads = (n_out >= 64) ? 4 : 1;
-    if (n_threads == 1) {
-        worker(0, n_out);
-    } else {
-        std::vector<std::thread> workers;
-        workers.reserve(n_threads);
-        int chunk_size = n_out / n_threads;
-
-        for (int t = 0; t < n_threads; t++) {
-            int r_start = t * chunk_size;
-            int r_end   = (t == n_threads - 1) ? n_out : r_start + chunk_size;
-            workers.emplace_back(worker, r_start, r_end);
-        }
-        for (auto &w : workers) {
-            w.join();
-        }
-    }
+    parallel_rows(n_out, worker);
 }
 
 void matvec_q4_k_diag(float *out, const void *W, const float *x, int n_out, int n_in, DiagMode mode) {
@@ -456,23 +422,7 @@ static void matvec_q6_k_impl(float *out, const void *W, const float *x, int n_ou
         }
     };
 
-    const int n_threads = (n_out >= 64) ? 4 : 1;
-    if (n_threads == 1) {
-        worker(0, n_out);
-    } else {
-        std::vector<std::thread> workers;
-        workers.reserve(n_threads);
-        int chunk_size = n_out / n_threads;
-
-        for (int t = 0; t < n_threads; t++) {
-            int r_start = t * chunk_size;
-            int r_end   = (t == n_threads - 1) ? n_out : r_start + chunk_size;
-            workers.emplace_back(worker, r_start, r_end);
-        }
-        for (auto &w : workers) {
-            w.join();
-        }
-    }
+    parallel_rows(n_out, worker);
 }
 
 void matvec_q6_k_diag(float *out, const void *W, const float *x, int n_out, int n_in, DiagMode mode) {
