@@ -1,5 +1,7 @@
 #include "dequant.h"
 #include <cstdio>
+#include <cmath>
+#include <cstring>
 
 // ── f16_to_f32 ──
 // IEEE 754 float16: [1 sign][5 exponent][10 mantissa]
@@ -183,6 +185,46 @@ void dequantize_q6_k(const void *src, float *dst, size_t n_elements) {
             ql += 64;
             qh += 32;
             sc += 8;
+        }
+    }
+}
+
+// ── quantize_q8_k ──
+// Quantize float activations into BlockQ8_K super-blocks (256 values per block).
+void quantize_q8_k(const float *src, BlockQ8_K *dst, size_t n_elements) {
+    size_t n_blocks = n_elements / 256;
+    for (size_t b = 0; b < n_blocks; b++) {
+        const float *x = src + b * 256;
+        BlockQ8_K *block = &dst[b];
+
+        float max_val = 0.0f;
+        for (int i = 0; i < 256; i++) {
+            float v = fabsf(x[i]);
+            if (v > max_val) max_val = v;
+        }
+
+        if (max_val == 0.0f) {
+            block->d = 0.0f;
+            std::memset(block->qs, 0, sizeof(block->qs));
+            std::memset(block->bsums, 0, sizeof(block->bsums));
+            continue;
+        }
+
+        float d = max_val / 127.0f;
+        float id = 127.0f / max_val;
+        block->d = d;
+
+        for (int c = 0; c < 16; c++) {
+            int16_t sum = 0;
+            for (int l = 0; l < 16; l++) {
+                int idx = c * 16 + l;
+                int q = (int)roundf(x[idx] * id);
+                if (q > 127)  q = 127;
+                if (q < -128) q = -128;
+                block->qs[idx] = (int8_t)q;
+                sum += (int16_t)q;
+            }
+            block->bsums[c] = sum;
         }
     }
 }

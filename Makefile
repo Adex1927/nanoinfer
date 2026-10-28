@@ -1,6 +1,6 @@
 # Compiler and flags
 CXX      := clang++
-CXXFLAGS := -std=c++17 -Wall -Wextra -O3
+CXXFLAGS := -std=c++17 -Wall -Wextra -O3 -mcpu=apple-m3
 
 # Target binary name and source files
 TARGET   := model_test

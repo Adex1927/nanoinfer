@@ -59,6 +59,17 @@ struct BlockQ6_K {
     uint16_t d;          // super-block scale (float16)
 };
 
+// ── BlockQ8_K format ──
+// Used for runtime quantization of activation vectors.
+// Each super-block encodes 256 activations:
+//   [ float32 d ][ 256 × int8 qs ][ 16 × int16 bsums ]
+//   = 4 + 256 + 32 = 292 bytes
+struct BlockQ8_K {
+    float   d;           // super-block scale: max(|x|) / 127.0f
+    int8_t  qs[256];     // 256 quantized int8 values
+    int16_t bsums[16];   // sums of 16 int8s each (16 * 16 = 256 values)
+};
+
 // ── Helper: unpack 6-bit sub-block scale and min for Q4_K ──
 static inline void get_scale_min_k4(int j, const uint8_t *scales, uint8_t *sc, uint8_t *m) {
     if (j < 4) {
@@ -84,6 +95,10 @@ void dequantize_q4_k(const void *src, float *dst, size_t n_elements);
 
 // Dequantize a Q6_K tensor.
 void dequantize_q6_k(const void *src, float *dst, size_t n_elements);
+
+// Quantize float activations into BlockQ8_K super-blocks (256 elements per block).
+// n_elements must be a multiple of 256.
+void quantize_q8_k(const float *src, BlockQ8_K *dst, size_t n_elements);
 
 // ── Unified dispatcher ──
 // Dequantize any supported tensor type into float32.
