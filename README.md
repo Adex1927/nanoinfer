@@ -78,25 +78,25 @@ first 10 dequantized weights: -0.012451 0.003906 -0.021484 ...
 
 ## Performance & Benchmarks
 
-Measured on Apple Silicon (ARM NEON, multi-accumulators, 4 threads) running **TinyLlama 1.1B (`Q4_K_M`)** across **200 generated tokens**:
+Measured on Apple Silicon (Apple M3, ARM NEON SDOT `vdotq_s32`, persistent thread pool, 4 threads) running **TinyLlama 1.1B (`Q4_K_M`)** across **200 generated tokens**:
 
-- **Decode Latency:** **~65.4 ms/token** (~15.3 tokens/sec) — down from **1041 ms/token** baseline (**~15.9× speedup**)
+- **Decode Latency:** **~17.0 ms/token** (**~58.8 tokens/sec**) — down from **1041 ms/token** naive baseline (**~61× speedup**)
 - **DRAM Traffic per Token:** **0 GB** (fused in-register quantized GEMV)
 
 ### Breakdown by Component (averaged over 200 tokens from `probe.csv`)
 
 | Component / Stage | Phase | Samples | Avg Latency | Notes |
 | :--- | :--- | :--- | :--- | :--- |
-| `decode:forward_token` | `decode` | 200 | **65.39 ms** | Total per-token decode step |
-| `all_layers` | `decode` | 200 | **42.30 ms** | 22 transformer layers combined |
-| ├── `layer:ffn` | `decode` | 4400 | **1.32 ms** | SwiGLU FFN (Gate + Up + Down projections) |
-| ├── `layer:qkv_proj` | `decode` | 4400 | **0.32 ms** | Q, K, V projections |
-| ├── `layer:attn_out_proj` | `decode` | 4400 | **0.19 ms** | Attention output projection |
+| `decode:forward_token` | `decode` | 200 | **17.01 ms** | Total per-token decode step (~58.8 tok/s) |
+| `all_layers` | `decode` | 200 | **16.07 ms** | 22 transformer layers combined |
+| ├── `layer:ffn` | `decode` | 4400 | **0.46 ms** | SwiGLU FFN (`Q4_K` / `Q6_K` SDOT kernels) |
+| ├── `layer:qkv_proj` | `decode` | 4400 | **0.10 ms** | Q, K, V projections |
+| ├── `layer:attn_out_proj` | `decode` | 4400 | **0.06 ms** | Attention output projection |
 | ├── `layer:mha` | `decode` | 4400 | **0.09 ms** | Multi-head attention (KV cache lookup & softmax) |
-| ├── `layer:rope` | `decode` | 4400 | **0.01 ms** | Rotary Position Embeddings |
+| ├── `layer:rope` | `decode` | 4400 | **0.009 ms** | Rotary Position Embeddings |
 | └── `layer:attn_norm` | `decode` | 4400 | **0.002 ms** | RMSNorm |
-| `embedding_lookup` | `decode` | 200 | **20.69 ms** | Token embedding dequantization |
-| `final_norm_and_lm_head`| `decode` | 200 | **2.40 ms** | RMSNorm + Vocab projection (fused `Q6_K`) |
+| `embedding_lookup` | `decode` | 200 | **0.09 ms** | Single-row dequantization (zero full-weight alloc) |
+| `final_norm_and_lm_head`| `decode` | 200 | **0.85 ms** | RMSNorm + Vocab projection (`Q6_K` SDOT) |
 | `decode:argmax` | `decode` | 200 | **0.02 ms** | Greedy token sampling |
 
 To reproduce these metrics on your machine:
@@ -113,10 +113,11 @@ python3 benchmarks/run_bench.py path/to/tinyllama.gguf 200
 - [x] Attention mechanism (GQA), RoPE, and KV Cache
 - [x] Tokenizer (SentencePiece / BPE)
 - [x] End-to-end autoregressive text generation
-- [x] Fused in-register quantized GEMV (`Q8_0`, `Q4_K`, `Q6_K`)
-- [x] ARM NEON SIMD vectorization & Multi-Accumulators (ILP)
-- [ ] Multi-threaded GEMV (distributing outer row loop across CPU cores)
-- [ ] Quantized embedding lookup optimization
+- [x] Single-row embedding lookup optimization (20.5 ms -> 0.09 ms)
+- [x] Persistent zero-heap thread pool (4 threads, static row partition)
+- [x] ARM NEON SDOT (`vdotq_s32`) fused quantized GEMV for `Q4_K` and `Q6_K`
+- [ ] Fuse `gate` + `up` GEMVs (shared quantized activations)
+- [ ] Pipeline parallelism over TCP sockets
 
 ---
 
