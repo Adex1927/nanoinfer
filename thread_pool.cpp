@@ -1,4 +1,11 @@
 #include "thread_pool.h"
+#include <algorithm>
+#include <cstdlib>
+
+#if defined(__APPLE__)
+#include <pthread.h>
+#include <pthread/qos.h>
+#endif
 
 // Start n_workers threads. Each one runs worker_loop(i) on this pool.
 // n_workers is stored first (initializer list) so workers can read it safely;
@@ -26,10 +33,11 @@ ThreadPool::~ThreadPool() {
 void ThreadPool::run(Job fn, void *ctx, int n_out) {
     {
         std::lock_guard<std::mutex> lock(mu);
-        job_fn  = fn;
-        job_ctx = ctx;
-        job_n   = n_out;
-        pending = n_workers;
+        job_fn      = fn;
+        job_ctx     = ctx;
+        job_n       = n_out;
+        current_row.store(0, std::memory_order_relaxed);
+        pending     = n_workers;
         generation++;
     }
     work_cv.notify_all();
@@ -39,10 +47,13 @@ void ThreadPool::run(Job fn, void *ctx, int n_out) {
 }
 
 // What each worker thread does for its whole lifetime:
-// wait for a new job -> run my chunk -> report done -> repeat.
+// wait for a new job -> dynamically steal row chunks -> report done -> repeat.
 void ThreadPool::worker_loop(int id) {
-    // Start at 0, NOT at the current `generation`. If run() is called before
-    // this thread gets here, generation is already 1 and we still see the job.
+    (void)id;
+#if defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+
     uint64_t seen = 0;
 
     while (true) {
@@ -51,18 +62,22 @@ void ThreadPool::worker_loop(int id) {
         if (stop) return;
 
         // Copy the job out while holding the lock, then release it so the
-        // workers compute in parallel instead of one at a time.
+        // workers compute in parallel without holding the lock.
         seen     = generation;
         Job   fn  = job_fn;
         void *ctx = job_ctx;
         int   n   = job_n;
         lock.unlock();
 
-        // My chunk of rows; the last worker takes the remainder.
-        int chunk   = n / n_workers;
-        int r_start = id * chunk;
-        int r_end   = (id == n_workers - 1) ? n : r_start + chunk;
-        if (r_start < r_end) fn(ctx, r_start, r_end);
+        // Dynamic work stealing: claim chunks atomically.
+        // Adaptive chunk sizing balances dispatch overhead and load balancing.
+        const int chunk_size = (n < 256) ? 8 : (n < 2048 ? 16 : 32);
+        while (true) {
+            int r_start = current_row.fetch_add(chunk_size, std::memory_order_relaxed);
+            if (r_start >= n) break;
+            int r_end = std::min(r_start + chunk_size, n);
+            fn(ctx, r_start, r_end);
+        }
 
         // Report done. Whoever finishes last wakes run().
         lock.lock();
@@ -71,6 +86,14 @@ void ThreadPool::worker_loop(int id) {
 }
 
 ThreadPool &global_pool() {
-    static ThreadPool pool(4);
+    static int n_workers = []() {
+        const char *env = getenv("NANO_THREADS");
+        if (env) {
+            int n = atoi(env);
+            if (n > 0) return n;
+        }
+        return 6; // Default to all 8 cores on Apple M3 (4 P-cores + 4 E-cores)
+    }();
+    static ThreadPool pool(n_workers);
     return pool;
 }
