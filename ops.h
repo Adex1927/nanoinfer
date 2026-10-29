@@ -48,17 +48,22 @@ enum class DiagMode {
 void matvec_q8_0(float *out, const void *W, const float *x, int n_out, int n_in);
 void matvec_q8_0_diag(float *out, const void *W, const float *x, int n_out, int n_in, DiagMode mode);
 
+struct BlockQ8_K;
+
 // ── Fused Quantized Matrix-Vector Multiply (Q4_K) ──
 // Computes: out = W * x directly from quantized 256-weight super-blocks.
 // W points to row-major BlockQ4_K blocks. n_in must be a multiple of 256.
-void matvec_q4_k(float *out, const void *W, const float *x, int n_out, int n_in);
-void matvec_q4_k_diag(float *out, const void *W, const float *x, int n_out, int n_in, DiagMode mode);
+void matvec_q4_k(float *out, const void *W, const float *x, int n_out, int n_in, BlockQ8_K *q8_buf = nullptr);
+void matvec_q4_k_diag(float *out, const void *W, const float *x, int n_out, int n_in, DiagMode mode, BlockQ8_K *q8_buf = nullptr);
+void matvec_q4_k_gate_up(float *out_gate, float *out_up,
+                         const void *W_gate, const void *W_up,
+                         const float *x, int n_out, int n_in, BlockQ8_K *q8_buf = nullptr);
 
 // ── Fused Quantized Matrix-Vector Multiply (Q6_K) ──
 // Computes: out = W * x directly from quantized 256-weight super-blocks.
 // W points to row-major BlockQ6_K blocks. n_in must be a multiple of 256.
-void matvec_q6_k(float *out, const void *W, const float *x, int n_out, int n_in);
-void matvec_q6_k_diag(float *out, const void *W, const float *x, int n_out, int n_in, DiagMode mode);
+void matvec_q6_k(float *out, const void *W, const float *x, int n_out, int n_in, BlockQ8_K *q8_buf = nullptr);
+void matvec_q6_k_diag(float *out, const void *W, const float *x, int n_out, int n_in, DiagMode mode, BlockQ8_K *q8_buf = nullptr);
 
 // ── Softmax ──
 // Converts a vector of raw scores into a probability distribution.

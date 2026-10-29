@@ -25,7 +25,7 @@ static float *dequant(LlamaModel *llama, TensorInfo *info) {
 // Fused quantized matvec dispatcher:
 // Evaluates quantized blocks in-place without heap allocation.
 // Falls back to dequant + matvec if format is not yet fused.
-static void matvec_tensor(float *out, LlamaModel *llama, TensorInfo *info, const float *x, int n_out, int n_in) {
+static void matvec_tensor(float *out, LlamaModel *llama, TensorInfo *info, const float *x, int n_out, int n_in, BlockQ8_K *q8_buf = nullptr) {
     static const bool force_old = (getenv("NANO_OLD_MATVEC") != nullptr);
     static const DiagMode diag_mode = []() {
         const char *d = getenv("NANO_DIAG");
@@ -38,13 +38,13 @@ static void matvec_tensor(float *out, LlamaModel *llama, TensorInfo *info, const
     if (!force_old) {
         const void *raw = get_tensor_data(llama->model, info->name);
         if (info->type == GGML_TYPE_Q4_K && (n_in % 256 == 0)) {
-            matvec_q4_k_diag(out, raw, x, n_out, n_in, diag_mode);
+            matvec_q4_k_diag(out, raw, x, n_out, n_in, diag_mode, q8_buf);
             return;
         } else if (info->type == GGML_TYPE_Q8_0 && (n_in % 32 == 0)) {
             matvec_q8_0_diag(out, raw, x, n_out, n_in, diag_mode);
             return;
         } else if (info->type == GGML_TYPE_Q6_K && (n_in % 256 == 0)) {
-            matvec_q6_k_diag(out, raw, x, n_out, n_in, diag_mode);
+            matvec_q6_k_diag(out, raw, x, n_out, n_in, diag_mode, q8_buf);
             return;
         }
     }
@@ -162,9 +162,9 @@ void forward_layer(LlamaModel *llama, InferState *s, int layer, int pos,
     // 2. Q / K / V projections: s->xb → s->q, s->k, s->v
     {
         auto t = pa_qkv->start();
-        matvec_tensor(s->q, llama, lw.attn_q, s->xb, n_embd, n_embd);
-        matvec_tensor(s->k, llama, lw.attn_k, s->xb, kv_dim, n_embd);
-        matvec_tensor(s->v, llama, lw.attn_v, s->xb, kv_dim, n_embd);
+        matvec_tensor(s->q, llama, lw.attn_q, s->xb, n_embd, n_embd, s->q8_buf);
+        matvec_tensor(s->k, llama, lw.attn_k, s->xb, kv_dim, n_embd, s->q8_buf);
+        matvec_tensor(s->v, llama, lw.attn_v, s->xb, kv_dim, n_embd, s->q8_buf);
         pa_qkv->stop(t);
     }
 
@@ -186,16 +186,14 @@ void forward_layer(LlamaModel *llama, InferState *s, int layer, int pos,
         pa_mha->stop(t);
     }
 
-    // 5. Attention output projection: s->xb → xb2, then add to residual s->x.
+    // 5. Attention output projection: s->xb → s->xb2, then add to residual s->x.
     //    This projects the attention output back to n_embd dimension.
     //    The residual add is the "skip connection" around the attention block.
     {
         auto t = pa_out_proj->start();
-        float *xb2 = (float *)calloc(n_embd, sizeof(float));
-        matvec_tensor(xb2, llama, lw.attn_output, s->xb, n_embd, n_embd);
+        matvec_tensor(s->xb2, llama, lw.attn_output, s->xb, n_embd, n_embd, s->q8_buf);
 
-        for (int i = 0; i < n_embd; i++) s->x[i] += xb2[i];  // residual add
-        free(xb2);
+        for (int i = 0; i < n_embd; i++) s->x[i] += s->xb2[i];  // residual add
         pa_out_proj->stop(t);
     }
 
@@ -212,8 +210,14 @@ void forward_layer(LlamaModel *llama, InferState *s, int layer, int pos,
         // 7. Gate and Up projections: both read the same s->xb, produce n_ff outputs.
         //    SwiGLU formula: FFN(x) = (silu(gate) ⊙ up) · W_down
         {
-            matvec_tensor(s->hb,  llama, lw.ffn_gate, s->xb, n_ff, n_embd);  // gate → hb
-            matvec_tensor(s->hb2, llama, lw.ffn_up,   s->xb, n_ff, n_embd);  // up   → hb2
+            if (lw.ffn_gate->type == GGML_TYPE_Q4_K && lw.ffn_up->type == GGML_TYPE_Q4_K && (n_embd % 256 == 0)) {
+                const void *raw_gate = get_tensor_data(llama->model, lw.ffn_gate->name);
+                const void *raw_up   = get_tensor_data(llama->model, lw.ffn_up->name);
+                matvec_q4_k_gate_up(s->hb, s->hb2, raw_gate, raw_up, s->xb, n_ff, n_embd, s->q8_buf);
+            } else {
+                matvec_tensor(s->hb,  llama, lw.ffn_gate, s->xb, n_ff, n_embd, s->q8_buf);  // gate → hb
+                matvec_tensor(s->hb2, llama, lw.ffn_up,   s->xb, n_ff, n_embd, s->q8_buf);  // up   → hb2
+            }
         }
 
         // 8. SwiGLU activation: apply silu to gate, then element-wise multiply by up.
@@ -222,11 +226,9 @@ void forward_layer(LlamaModel *llama, InferState *s, int layer, int pos,
 
         // 9. Down projection: n_ff → n_embd, then residual add.
         {
-            float *xb2   = (float *)calloc(n_embd, sizeof(float));
-            matvec_tensor(xb2, llama, lw.ffn_down, s->hb, n_embd, n_ff);
+            matvec_tensor(s->xb2, llama, lw.ffn_down, s->hb, n_embd, n_ff, s->q8_buf);
 
-            for (int i = 0; i < n_embd; i++) s->x[i] += xb2[i];  // residual add
-            free(xb2);
+            for (int i = 0; i < n_embd; i++) s->x[i] += s->xb2[i];  // residual add
         }
 
         pa_ffn->stop(t);
@@ -299,7 +301,7 @@ void forward_token(LlamaModel *llama, InferState *s, int token, int pos, bool ne
         Probe p("final_norm_and_lm_head");
         float *w = (float *)get_tensor_data(llama->model, llama->output_norm->name);
         rmsnorm(s->x, s->x, w, s->n_embd, llama->hparams.rms_norm_eps);
-        matvec_tensor(s->logits, llama, llama->output, s->x, s->n_vocab, s->n_embd);
+        matvec_tensor(s->logits, llama, llama->output, s->x, s->n_vocab, s->n_embd, s->q8_buf);
     }
 }
 

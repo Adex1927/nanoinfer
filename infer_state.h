@@ -2,6 +2,7 @@
 #define INFER_STATE_H
 
 #include "llama_model.h"
+#include "dequant.h"
 
 // ── InferState ──
 // All mutable buffers needed during a forward pass.
@@ -14,6 +15,7 @@
 //   - the FFN hidden buffer                  (hb)
 //   - the final output logits                (logits)
 //   - the KV cache                           (k_cache, v_cache)
+//   - quantized activation scratch buffer    (q8_buf)
 //
 // One InferState = one independent inference session.
 // Multiple sessions can share the same LlamaModel.
@@ -23,6 +25,8 @@ struct InferState {
 
     float *x;       // [n_embd] — main residual stream (current token's state)
     float *xb;      // [n_embd] — scratch: holds the normed x before attention/FFN
+    float *xb2;     // [n_embd] — scratch: projection result before residual add
+    BlockQ8_K *q8_buf; // [max(n_embd, n_ff) / 256] — quantized activations for SDOT GEMV
 
     // ── attention buffers ──
 

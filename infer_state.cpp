@@ -26,6 +26,7 @@ InferState *alloc_infer_state(const LlamaHparams *hp) {
 
     s->x      = (float *)calloc(s->n_embd, sizeof(float));
     s->xb     = (float *)calloc(s->n_embd, sizeof(float));
+    s->xb2    = (float *)calloc(s->n_embd, sizeof(float));
 
     // ── attention buffers ──
 
@@ -60,9 +61,14 @@ InferState *alloc_infer_state(const LlamaHparams *hp) {
     s->k_cache = (float *)calloc(kv_cache_size, sizeof(float));
     s->v_cache = (float *)calloc(kv_cache_size, sizeof(float));
 
+    // ── Quantized activation scratch buffer ──
+    size_t max_n_in = (size_t)((s->n_embd > s->n_ff) ? s->n_embd : s->n_ff);
+    size_t q8_blocks = (max_n_in + 255) / 256;
+    s->q8_buf = (BlockQ8_K *)calloc(q8_blocks, sizeof(BlockQ8_K));
+
     // basic allocation check
-    if (!s->x || !s->xb || !s->q || !s->k || !s->v ||
-        !s->att || !s->hb || !s->hb2 || !s->logits || !s->k_cache || !s->v_cache) {
+    if (!s->x || !s->xb || !s->xb2 || !s->q || !s->k || !s->v ||
+        !s->att || !s->hb || !s->hb2 || !s->logits || !s->k_cache || !s->v_cache || !s->q8_buf) {
         fprintf(stderr, "alloc_infer_state: out of memory\n");
         free_infer_state(s);
         return nullptr;
@@ -77,6 +83,8 @@ void free_infer_state(InferState *s) {
     if (!s) return;
     free(s->x);
     free(s->xb);
+    free(s->xb2);
+    free(s->q8_buf);
     free(s->q);
     free(s->k);
     free(s->v);

@@ -158,18 +158,85 @@ void matvec_q8_0(float *out, const void *W, const float *x, int n_out, int n_in)
 }
 
 // ── Fused Quantized Matrix-Vector Multiply (Q4_K) ──
+static inline float dot_row_q4_k_sdot(const BlockQ4_K *row, const BlockQ8_K *q8_buf, int blocks_per_row) {
+    float row_sum = 0.0f;
+    for (int b = 0; b < blocks_per_row; b++) {
+        const BlockQ4_K *block = &row[b];
+        const BlockQ8_K *q8 = &q8_buf[b];
+        const uint8_t *q = block->quants;
+
+        float d    = f16_to_f32(block->d);
+        float dmin = f16_to_f32(block->dmin);
+
+        int sub_block = 0;
+        float super_sum = 0.0f;
+
+        for (int chunk = 0; chunk < 256; chunk += 64) {
+            uint8_t sc1, m1_raw, sc2, m2_raw;
+            get_scale_min_k4(sub_block, block->scales, &sc1, &m1_raw);
+            get_scale_min_k4(sub_block + 1, block->scales, &sc2, &m2_raw);
+            float d1 = d * sc1;
+            float m1 = dmin * m1_raw;
+            float d2 = d * sc2;
+            float m2 = dmin * m2_raw;
+
+            const int8_t *qs_sub1 = q8->qs + chunk;
+            const int8_t *qs_sub2 = q8->qs + chunk + 32;
+
+            int sum_qs1 = (int)q8->bsums[2 * sub_block]     + (int)q8->bsums[2 * sub_block + 1];
+            int sum_qs2 = (int)q8->bsums[2 * sub_block + 2] + (int)q8->bsums[2 * sub_block + 3];
+
+#if defined(__ARM_FEATURE_DOTPROD)
+            uint8x16_t bytes0 = vld1q_u8(q);
+            uint8x16_t bytes1 = vld1q_u8(q + 16);
+
+            int8x16_t q1_0 = vreinterpretq_s8_u8(vandq_u8(bytes0, vdupq_n_u8(0x0F)));
+            int8x16_t q1_1 = vreinterpretq_s8_u8(vandq_u8(bytes1, vdupq_n_u8(0x0F)));
+
+            int8x16_t q2_0 = vreinterpretq_s8_u8(vshrq_n_u8(bytes0, 4));
+            int8x16_t q2_1 = vreinterpretq_s8_u8(vshrq_n_u8(bytes1, 4));
+
+            int8x16_t ax1_0 = vld1q_s8(qs_sub1);
+            int8x16_t ax1_1 = vld1q_s8(qs_sub1 + 16);
+            int8x16_t ax2_0 = vld1q_s8(qs_sub2);
+            int8x16_t ax2_1 = vld1q_s8(qs_sub2 + 16);
+
+            int32x4_t acc1 = vdotq_s32(vdupq_n_s32(0), q1_0, ax1_0);
+            acc1           = vdotq_s32(acc1,            q1_1, ax1_1);
+
+            int32x4_t acc2 = vdotq_s32(vdupq_n_s32(0), q2_0, ax2_0);
+            acc2           = vdotq_s32(acc2,            q2_1, ax2_1);
+
+            int32_t dot1 = vaddvq_s32(acc1);
+            int32_t dot2 = vaddvq_s32(acc2);
+#else
+            int32_t dot1 = 0;
+            int32_t dot2 = 0;
+            for (int l = 0; l < 32; l++) {
+                dot1 += (int32_t)(q[l] & 0x0F) * (int32_t)qs_sub1[l];
+                dot2 += (int32_t)(q[l] >> 4)   * (int32_t)qs_sub2[l];
+            }
+#endif
+            super_sum += (d1 * (float)dot1 - m1 * (float)sum_qs1);
+            super_sum += (d2 * (float)dot2 - m2 * (float)sum_qs2);
+
+            q += 32;
+            sub_block += 2;
+        }
+
+        row_sum += super_sum * q8->d;
+    }
+    return row_sum;
+}
+
 template <DiagMode Mode>
-static void matvec_q4_k_impl(float *out, const void *W, const float *x, int n_out, int n_in) {
+static void matvec_q4_k_impl(float *out, const void *W, const float *x, int n_out, int n_in, BlockQ8_K *q8_buf = nullptr) {
     const BlockQ4_K *blocks = (const BlockQ4_K *)W;
     int blocks_per_row = n_in / 256;
 
-    // Buffer for quantized activations. Sized for up to 32768 floats (zero heap allocation).
-    static thread_local BlockQ8_K q8_scratch[128];
-    BlockQ8_K *q8_buf = q8_scratch;
-    std::vector<BlockQ8_K> q8_fallback;
-    if (blocks_per_row > 128) {
-        q8_fallback.resize(blocks_per_row);
-        q8_buf = q8_fallback.data();
+    if (!q8_buf) {
+        static thread_local BlockQ8_K fallback[128];
+        q8_buf = fallback;
     }
 
     if constexpr (Mode == DiagMode::NORMAL) {
@@ -181,104 +248,49 @@ static void matvec_q4_k_impl(float *out, const void *W, const float *x, int n_ou
             const BlockQ4_K *row = blocks + i * blocks_per_row;
             float row_sum = 0.0f;
 
-            for (int b = 0; b < blocks_per_row; b++) {
-                const BlockQ4_K *block = &row[b];
-                const uint8_t *q = block->quants;
+            if constexpr (Mode == DiagMode::NORMAL) {
+                row_sum = dot_row_q4_k_sdot(row, q8_buf, blocks_per_row);
+            } else {
+                for (int b = 0; b < blocks_per_row; b++) {
+                    const BlockQ4_K *block = &row[b];
+                    const uint8_t *q = block->quants;
 
-                float d    = f16_to_f32(block->d);
-                float dmin = f16_to_f32(block->dmin);
+                    float d    = f16_to_f32(block->d);
+                    float dmin = f16_to_f32(block->dmin);
 
-                int sub_block = 0;
+                    int sub_block = 0;
 
-                if constexpr (Mode == DiagMode::MEM_ONLY) {
-                    uint32_t q_sum = 0;
-                    for (int l = 0; l < 32; l++) {
-                        q_sum += q[l];
-                    }
-                    row_sum += (float)(q_sum * 2);
-                } else if constexpr (Mode == DiagMode::COMPUTE_2X) {
-                    const float *x_super = x + b * 256;
-                    for (int chunk = 0; chunk < 256; chunk += 64) {
-                        uint8_t sc1, m1_raw, sc2, m2_raw;
-                        get_scale_min_k4(sub_block, block->scales, &sc1, &m1_raw);
-                        get_scale_min_k4(sub_block + 1, block->scales, &sc2, &m2_raw);
-                        float d1 = d * sc1, m1 = dmin * m1_raw;
-                        float d2 = d * sc2, m2 = dmin * m2_raw;
-                        const float *x_sub1 = x_super + chunk;
-                        const float *x_sub2 = x_super + chunk + 32;
-                        float q_sum1 = 0.0f, x_sum1 = 0.0f;
-                        float q_sum2 = 0.0f, x_sum2 = 0.0f;
+                    if constexpr (Mode == DiagMode::MEM_ONLY) {
+                        uint32_t q_sum = 0;
                         for (int l = 0; l < 32; l++) {
-                            float q_val1 = (float)(q[l] & 0xF);
-                            float q_val2 = (float)(q[l] >> 4);
-                            q_sum1 += q_val1 * x_sub1[l] + (q_val1 + 1.0f) * x_sub1[l];
-                            x_sum1 += x_sub1[l];
-                            q_sum2 += q_val2 * x_sub2[l] + (q_val2 + 1.0f) * x_sub2[l];
-                            x_sum2 += x_sub2[l];
+                            q_sum += q[l];
                         }
-                        row_sum += (d1 * q_sum1 - m1 * x_sum1) + (d2 * q_sum2 - m2 * x_sum2);
-                        q += 32;
-                        sub_block += 2;
-                    }
-                } else {
-                    // Normal mode: SDOT
-                    const BlockQ8_K *q8 = &q8_buf[b];
-                    float super_sum = 0.0f;
-
-                    for (int chunk = 0; chunk < 256; chunk += 64) {
-                        uint8_t sc1, m1_raw, sc2, m2_raw;
-                        get_scale_min_k4(sub_block, block->scales, &sc1, &m1_raw);
-                        get_scale_min_k4(sub_block + 1, block->scales, &sc2, &m2_raw);
-                        float d1 = d * sc1;
-                        float m1 = dmin * m1_raw;
-                        float d2 = d * sc2;
-                        float m2 = dmin * m2_raw;
-
-                        const int8_t *qs_sub1 = q8->qs + chunk;
-                        const int8_t *qs_sub2 = q8->qs + chunk + 32;
-
-                        int sum_qs1 = (int)q8->bsums[2 * sub_block]     + (int)q8->bsums[2 * sub_block + 1];
-                        int sum_qs2 = (int)q8->bsums[2 * sub_block + 2] + (int)q8->bsums[2 * sub_block + 3];
-
-#if defined(__ARM_FEATURE_DOTPROD)
-                        uint8x16_t bytes0 = vld1q_u8(q);
-                        uint8x16_t bytes1 = vld1q_u8(q + 16);
-
-                        int8x16_t q1_0 = vreinterpretq_s8_u8(vandq_u8(bytes0, vdupq_n_u8(0x0F)));
-                        int8x16_t q1_1 = vreinterpretq_s8_u8(vandq_u8(bytes1, vdupq_n_u8(0x0F)));
-
-                        int8x16_t q2_0 = vreinterpretq_s8_u8(vshrq_n_u8(bytes0, 4));
-                        int8x16_t q2_1 = vreinterpretq_s8_u8(vshrq_n_u8(bytes1, 4));
-
-                        int8x16_t ax1_0 = vld1q_s8(qs_sub1);
-                        int8x16_t ax1_1 = vld1q_s8(qs_sub1 + 16);
-                        int8x16_t ax2_0 = vld1q_s8(qs_sub2);
-                        int8x16_t ax2_1 = vld1q_s8(qs_sub2 + 16);
-
-                        int32x4_t acc1 = vdotq_s32(vdupq_n_s32(0), q1_0, ax1_0);
-                        acc1           = vdotq_s32(acc1,            q1_1, ax1_1);
-
-                        int32x4_t acc2 = vdotq_s32(vdupq_n_s32(0), q2_0, ax2_0);
-                        acc2           = vdotq_s32(acc2,            q2_1, ax2_1);
-
-                        int32_t dot1 = vaddvq_s32(acc1);
-                        int32_t dot2 = vaddvq_s32(acc2);
-#else
-                        int32_t dot1 = 0;
-                        int32_t dot2 = 0;
-                        for (int l = 0; l < 32; l++) {
-                            dot1 += (int32_t)(q[l] & 0x0F) * (int32_t)qs_sub1[l];
-                            dot2 += (int32_t)(q[l] >> 4)   * (int32_t)qs_sub2[l];
+                        row_sum += (float)(q_sum * 2);
+                    } else if constexpr (Mode == DiagMode::COMPUTE_2X) {
+                        const float *x_super = x + b * 256;
+                        for (int chunk = 0; chunk < 256; chunk += 64) {
+                            uint8_t sc1, m1_raw, sc2, m2_raw;
+                            get_scale_min_k4(sub_block, block->scales, &sc1, &m1_raw);
+                            get_scale_min_k4(sub_block + 1, block->scales, &sc2, &m2_raw);
+                            float d1 = d * sc1, m1 = dmin * m1_raw;
+                            float d2 = d * sc2, m2 = dmin * m2_raw;
+                            const float *x_sub1 = x_super + chunk;
+                            const float *x_sub2 = x_super + chunk + 32;
+                            float q_sum1 = 0.0f, x_sum1 = 0.0f;
+                            float q_sum2 = 0.0f, x_sum2 = 0.0f;
+                            for (int l = 0; l < 32; l++) {
+                                float q_val1 = (float)(q[l] & 0xF);
+                                float q_val2 = (float)(q[l] >> 4);
+                                q_sum1 += q_val1 * x_sub1[l] + (q_val1 + 1.0f) * x_sub1[l];
+                                x_sum1 += x_sub1[l];
+                                q_sum2 += q_val2 * x_sub2[l] + (q_val2 + 1.0f) * x_sub2[l];
+                                x_sum2 += x_sub2[l];
+                            }
+                            row_sum += (d1 * q_sum1 - m1 * x_sum1) + (d2 * q_sum2 - m2 * x_sum2);
+                            q += 32;
+                            sub_block += 2;
                         }
-#endif
-                        super_sum += (d1 * (float)dot1 - m1 * (float)sum_qs1);
-                        super_sum += (d2 * (float)dot2 - m2 * (float)sum_qs2);
-
-                        q += 32;
-                        sub_block += 2;
                     }
-
-                    row_sum += super_sum * q8->d;
                 }
             }
 
@@ -289,31 +301,51 @@ static void matvec_q4_k_impl(float *out, const void *W, const float *x, int n_ou
     parallel_rows(n_out, worker);
 }
 
-void matvec_q4_k_diag(float *out, const void *W, const float *x, int n_out, int n_in, DiagMode mode) {
+void matvec_q4_k_diag(float *out, const void *W, const float *x, int n_out, int n_in, DiagMode mode, BlockQ8_K *q8_buf) {
     switch (mode) {
-        case DiagMode::MEM_ONLY:   matvec_q4_k_impl<DiagMode::MEM_ONLY>(out, W, x, n_out, n_in); break;
-        case DiagMode::COMPUTE_2X: matvec_q4_k_impl<DiagMode::COMPUTE_2X>(out, W, x, n_out, n_in); break;
-        default:                   matvec_q4_k_impl<DiagMode::NORMAL>(out, W, x, n_out, n_in); break;
+        case DiagMode::MEM_ONLY:   matvec_q4_k_impl<DiagMode::MEM_ONLY>(out, W, x, n_out, n_in, q8_buf); break;
+        case DiagMode::COMPUTE_2X: matvec_q4_k_impl<DiagMode::COMPUTE_2X>(out, W, x, n_out, n_in, q8_buf); break;
+        default:                   matvec_q4_k_impl<DiagMode::NORMAL>(out, W, x, n_out, n_in, q8_buf); break;
     }
 }
 
-void matvec_q4_k(float *out, const void *W, const float *x, int n_out, int n_in) {
-    matvec_q4_k_impl<DiagMode::NORMAL>(out, W, x, n_out, n_in);
+void matvec_q4_k(float *out, const void *W, const float *x, int n_out, int n_in, BlockQ8_K *q8_buf) {
+    matvec_q4_k_impl<DiagMode::NORMAL>(out, W, x, n_out, n_in, q8_buf);
+}
+
+void matvec_q4_k_gate_up(float *out_gate, float *out_up,
+                         const void *W_gate, const void *W_up,
+                         const float *x, int n_out, int n_in, BlockQ8_K *q8_buf) {
+    const BlockQ4_K *blocks_gate = (const BlockQ4_K *)W_gate;
+    const BlockQ4_K *blocks_up   = (const BlockQ4_K *)W_up;
+    int blocks_per_row = n_in / 256;
+
+    if (!q8_buf) {
+        static thread_local BlockQ8_K fallback[128];
+        q8_buf = fallback;
+    }
+
+    quantize_q8_k(x, q8_buf, n_in);
+
+    auto worker = [&](int row_start, int row_end) {
+        for (int i = row_start; i < row_end; i++) {
+            out_gate[i] = dot_row_q4_k_sdot(blocks_gate + i * blocks_per_row, q8_buf, blocks_per_row);
+            out_up[i]   = dot_row_q4_k_sdot(blocks_up   + i * blocks_per_row, q8_buf, blocks_per_row);
+        }
+    };
+
+    parallel_rows(n_out, worker);
 }
 
 // ── Fused Quantized Matrix-Vector Multiply (Q6_K) ──
 template <DiagMode Mode>
-static void matvec_q6_k_impl(float *out, const void *W, const float *x, int n_out, int n_in) {
+static void matvec_q6_k_impl(float *out, const void *W, const float *x, int n_out, int n_in, BlockQ8_K *q8_buf = nullptr) {
     const BlockQ6_K *blocks = (const BlockQ6_K *)W;
     int blocks_per_row = n_in / 256;
 
-    // Buffer for quantized activations (zero heap allocation)
-    static thread_local BlockQ8_K q8_scratch[128];
-    BlockQ8_K *q8_buf = q8_scratch;
-    std::vector<BlockQ8_K> q8_fallback;
-    if (blocks_per_row > 128) {
-        q8_fallback.resize(blocks_per_row);
-        q8_buf = q8_fallback.data();
+    if (!q8_buf) {
+        static thread_local BlockQ8_K fallback[128];
+        q8_buf = fallback;
     }
 
     if constexpr (Mode == DiagMode::NORMAL) {
@@ -438,16 +470,16 @@ static void matvec_q6_k_impl(float *out, const void *W, const float *x, int n_ou
     parallel_rows(n_out, worker);
 }
 
-void matvec_q6_k_diag(float *out, const void *W, const float *x, int n_out, int n_in, DiagMode mode) {
+void matvec_q6_k_diag(float *out, const void *W, const float *x, int n_out, int n_in, DiagMode mode, BlockQ8_K *q8_buf) {
     switch (mode) {
-        case DiagMode::MEM_ONLY:   matvec_q6_k_impl<DiagMode::MEM_ONLY>(out, W, x, n_out, n_in); break;
-        case DiagMode::COMPUTE_2X: matvec_q6_k_impl<DiagMode::COMPUTE_2X>(out, W, x, n_out, n_in); break;
-        default:                   matvec_q6_k_impl<DiagMode::NORMAL>(out, W, x, n_out, n_in); break;
+        case DiagMode::MEM_ONLY:   matvec_q6_k_impl<DiagMode::MEM_ONLY>(out, W, x, n_out, n_in, q8_buf); break;
+        case DiagMode::COMPUTE_2X: matvec_q6_k_impl<DiagMode::COMPUTE_2X>(out, W, x, n_out, n_in, q8_buf); break;
+        default:                   matvec_q6_k_impl<DiagMode::NORMAL>(out, W, x, n_out, n_in, q8_buf); break;
     }
 }
 
-void matvec_q6_k(float *out, const void *W, const float *x, int n_out, int n_in) {
-    matvec_q6_k_impl<DiagMode::NORMAL>(out, W, x, n_out, n_in);
+void matvec_q6_k(float *out, const void *W, const float *x, int n_out, int n_in, BlockQ8_K *q8_buf) {
+    matvec_q6_k_impl<DiagMode::NORMAL>(out, W, x, n_out, n_in, q8_buf);
 }
 
 // ── Softmax ──
