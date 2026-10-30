@@ -237,10 +237,87 @@ static void test_quantize_q8_k() {
     printf("PASS\n");
 }
 
+static void test_mha_decode() {
+    printf("Testing mha_decode... ");
+
+    const int n_heads = 32;
+    const int n_kv_heads = 4;
+    const int head_dim = 64;
+    const int kv_dim = n_kv_heads * head_dim; // 256
+    const int n_ctx = 128;
+    const int pos = 63; // test attention across 64 tokens
+
+    std::vector<float> q(n_heads * head_dim);
+    for (size_t i = 0; i < q.size(); i++) {
+        q[i] = sinf((float)i * 0.05f) * 0.5f;
+    }
+
+    std::vector<float> k_cache(n_ctx * kv_dim);
+    std::vector<float> v_cache(n_ctx * kv_dim);
+    for (size_t i = 0; i < k_cache.size(); i++) {
+        k_cache[i] = cosf((float)i * 0.03f) * 0.4f;
+        v_cache[i] = sinf((float)i * 0.07f) * 0.6f;
+    }
+
+    std::vector<float> att_scratch_ref(n_heads * n_ctx, 0.0f);
+    std::vector<float> att_scratch_test(n_heads * n_ctx, 0.0f);
+
+    std::vector<float> xb_ref(n_heads * head_dim, 0.0f);
+    std::vector<float> xb_test(n_heads * head_dim, 0.0f);
+
+    // 1. Reference computation (scalar float)
+    float scale = 1.0f / sqrtf((float)head_dim);
+    int heads_per_group = n_heads / n_kv_heads;
+
+    for (int h = 0; h < n_heads; h++) {
+        int kv_head = h / heads_per_group;
+        const float *qh = q.data() + h * head_dim;
+        float *att_h = att_scratch_ref.data() + h * n_ctx;
+        float *xbh = xb_ref.data() + h * head_dim;
+
+        for (int t = 0; t <= pos; t++) {
+            const float *kt = k_cache.data() + t * kv_dim + kv_head * head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++) {
+                dot += qh[d] * kt[d];
+            }
+            att_h[t] = dot * scale;
+        }
+
+        softmax(att_h, att_h, pos + 1);
+
+        for (int d = 0; d < head_dim; d++) xbh[d] = 0.0f;
+        for (int t = 0; t <= pos; t++) {
+            const float *vt = v_cache.data() + t * kv_dim + kv_head * head_dim;
+            float w = att_h[t];
+            for (int d = 0; d < head_dim; d++) {
+                xbh[d] += w * vt[d];
+            }
+        }
+    }
+
+    // 2. Fused mha_decode kernel
+    mha_decode(xb_test.data(), q.data(), k_cache.data(), v_cache.data(),
+               att_scratch_test.data(), pos, n_heads, n_kv_heads, head_dim, kv_dim, n_ctx);
+
+    // 3. Compare outputs
+    float max_diff = 0.0f;
+    for (size_t i = 0; i < xb_ref.size(); i++) {
+        float diff = fabsf(xb_ref[i] - xb_test[i]);
+        if (diff > max_diff) max_diff = diff;
+    }
+
+    printf("max diff = %e -> %s\n", max_diff, (max_diff < 1e-4f) ? "PASS" : "FAIL");
+    if (max_diff >= 1e-4f) {
+        exit(1);
+    }
+}
+
 int main() {
     test_quantize_q8_k();
     test_matvec_q8_0();
     test_matvec_q4_k();
     test_matvec_q6_k();
+    test_mha_decode();
     return 0;
 }

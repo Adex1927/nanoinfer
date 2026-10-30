@@ -44,7 +44,6 @@
 #include <chrono>
 #include <cstdio>
 #include <cfloat>   // DBL_MAX
-#include <cstring>  // strncpy
 #include <map>
 #include <string>
 #include <unordered_map>

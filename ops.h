@@ -111,4 +111,12 @@ void silu(float *out, const float *x, int n);
 void rope(float *q, float *k, int pos, int n_heads, int n_kv_heads,
           int head_dim, int rope_dim_count, float freq_base);
 
+// ── Multi-Head Attention (MHA Decode) ──
+// Computes attention for one decode token across all Q-heads against the KV cache.
+// Evaluates Q * K_cache, softmax, and Attn * V_cache.
+void mha_decode(float *xb, const float *q,
+                const float *k_cache_layer, const float *v_cache_layer,
+                float *att_scratch, int pos,
+                int n_heads, int n_kv_heads, int head_dim, int kv_dim, int n_ctx);
+
 #endif // OPS_H

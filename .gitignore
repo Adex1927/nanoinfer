@@ -15,6 +15,7 @@ bench_ops
 *.pdb
 *.csv
 *.png
+!probe.png
 *.pdf
 
 # Model weights (prevent accidental large file commits)

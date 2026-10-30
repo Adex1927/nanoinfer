@@ -71,7 +71,7 @@ void ThreadPool::worker_loop(int id) {
 
         // Dynamic work stealing: claim chunks atomically.
         // Adaptive chunk sizing balances dispatch overhead and load balancing.
-        const int chunk_size = (n < 256) ? 8 : (n < 2048 ? 16 : 32);
+        const int chunk_size = (n <= 32) ? 4 : ((n < 256) ? 8 : (n < 2048 ? 16 : 32));
         while (true) {
             int r_start = current_row.fetch_add(chunk_size, std::memory_order_relaxed);
             if (r_start >= n) break;

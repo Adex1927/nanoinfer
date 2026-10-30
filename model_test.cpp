@@ -5,7 +5,6 @@
 #include "tokenizer.h"
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -76,7 +75,7 @@ int main(int argc, char **argv) {
 
     // ── Generation: greedy decode, streaming text ──
     // N via env NANO_N (default 20)
-    const int eos_id = 2;  // </s> for TinyLlama (tokenizer.ggml.eos_token_id)
+    const int eos_id = getenv("NANO_IGNORE_EOS") ? -1 : 2;  // </s> for TinyLlama
     int max_new = getenv("NANO_N") ? atoi(getenv("NANO_N")) : 50;
 
     struct Out {

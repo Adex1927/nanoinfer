@@ -2,7 +2,6 @@
 
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 
 // ── load_llama_model ──
 // 1. Load the raw GGUF via load_model()

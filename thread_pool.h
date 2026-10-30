@@ -66,8 +66,8 @@ ThreadPool &global_pool();
 // The stateless lambda `trampoline` converts to a C function pointer (Job),
 // and casts ctx back to the original worker reference.
 template <typename F>
-void parallel_rows(int n_out, F &&worker) {
-    if (n_out < 64) {
+void parallel_rows(int n_out, F &&worker, int min_parallel = 64) {
+    if (n_out < min_parallel) {
         worker(0, n_out);
         return;
     }
