@@ -59,11 +59,26 @@ void matvec_q4_k_gate_up(float *out_gate, float *out_up,
                          const void *W_gate, const void *W_up,
                          const float *x, int n_out, int n_in, BlockQ8_K *q8_buf = nullptr);
 
+// ── Fused Quantized Batched Matrix-Matrix Multiply (Q4_K) ──
+// Computes: out[n_tokens, n_out] = x[n_tokens, n_in] * W^T[n_out, n_in]
+// Tiled in groups of 4 tokens to reuse unpacked 4-bit weights 4x in NEON registers.
+void matmul_q4_k(float *out, const void *W, const float *x,
+                 int n_tokens, int n_out, int n_in, BlockQ8_K *q8_buf = nullptr);
+void matmul_q4_k_gate_up(float *out_gate, float *out_up,
+                         const void *W_gate, const void *W_up,
+                         const float *x, int n_tokens, int n_out, int n_in, BlockQ8_K *q8_buf = nullptr);
+
 // ── Fused Quantized Matrix-Vector Multiply (Q6_K) ──
 // Computes: out = W * x directly from quantized 256-weight super-blocks.
 // W points to row-major BlockQ6_K blocks. n_in must be a multiple of 256.
 void matvec_q6_k(float *out, const void *W, const float *x, int n_out, int n_in, BlockQ8_K *q8_buf = nullptr);
 void matvec_q6_k_diag(float *out, const void *W, const float *x, int n_out, int n_in, DiagMode mode, BlockQ8_K *q8_buf = nullptr);
+
+// ── Fused Quantized Batched Matrix-Matrix Multiply (Q6_K) ──
+// Computes: out[n_tokens, n_out] = x[n_tokens, n_in] * W^T[n_out, n_in]
+// Tiled in groups of 4 tokens to reuse unpacked 6-bit weights 4x in NEON registers.
+void matmul_q6_k(float *out, const void *W, const float *x,
+                 int n_tokens, int n_out, int n_in, BlockQ8_K *q8_buf = nullptr);
 
 // ── Softmax ──
 // Converts a vector of raw scores into a probability distribution.

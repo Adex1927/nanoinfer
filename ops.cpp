@@ -359,6 +359,207 @@ void matvec_q4_k_gate_up(float *out_gate, float *out_up,
     parallel_rows(n_out, worker);
 }
 
+// ── 4-Token Activation Register-Blocked Q4_K Dot Product ──
+// Loads and unpacks each 256-weight BlockQ4_K super-block from DRAM ONCE,
+// and computes SDOT against 4 token activation vectors (q8_0..q8_3) in NEON registers.
+static inline void dot_row_q4_k_batch4_sdot(
+    float *out0, float *out1, float *out2, float *out3,
+    const BlockQ4_K *row,
+    const BlockQ8_K *q8_0, const BlockQ8_K *q8_1,
+    const BlockQ8_K *q8_2, const BlockQ8_K *q8_3,
+    int blocks_per_row) {
+
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; b++) {
+        const BlockQ4_K *block = &row[b];
+        const BlockQ8_K *b0 = &q8_0[b];
+        const BlockQ8_K *b1 = &q8_1[b];
+        const BlockQ8_K *b2 = &q8_2[b];
+        const BlockQ8_K *b3 = &q8_3[b];
+        const uint8_t *q = block->quants;
+
+        float d    = f16_to_f32(block->d);
+        float dmin = f16_to_f32(block->dmin);
+
+        int sub_block = 0;
+
+#if defined(__ARM_FEATURE_DOTPROD)
+        int32x4_t bacc0 = vdupq_n_s32(0);
+        int32x4_t bacc1 = vdupq_n_s32(0);
+        int32x4_t bacc2 = vdupq_n_s32(0);
+        int32x4_t bacc3 = vdupq_n_s32(0);
+        int32_t macc0 = 0, macc1 = 0, macc2 = 0, macc3 = 0;
+        uint8x16_t mask_0f = vdupq_n_u8(0x0F);
+
+        for (int chunk = 0; chunk < 256; chunk += 64) {
+            uint8_t sc1, m1_raw, sc2, m2_raw;
+            get_scale_min_k4(sub_block, block->scales, &sc1, &m1_raw);
+            get_scale_min_k4(sub_block + 1, block->scales, &sc2, &m2_raw);
+
+            // Unpack 64 4-bit weights ONCE into 4 NEON registers
+            uint8x16_t bytes0 = vld1q_u8(q);
+            uint8x16_t bytes1 = vld1q_u8(q + 16);
+
+            int8x16_t q1_0 = vreinterpretq_s8_u8(vandq_u8(bytes0, mask_0f));
+            int8x16_t q1_1 = vreinterpretq_s8_u8(vandq_u8(bytes1, mask_0f));
+            int8x16_t q2_0 = vreinterpretq_s8_u8(vshrq_n_u8(bytes0, 4));
+            int8x16_t q2_1 = vreinterpretq_s8_u8(vshrq_n_u8(bytes1, 4));
+
+            int32_t s1 = (int32_t)sc1, s2 = (int32_t)sc2;
+            int32_t mr1 = (int32_t)m1_raw, mr2 = (int32_t)m2_raw;
+
+            auto accum_tok = [&](const BlockQ8_K *bk, int32x4_t &bacc, int32_t &macc) {
+                const int8_t *qs_sub1 = bk->qs + chunk;
+                const int8_t *qs_sub2 = bk->qs + chunk + 32;
+                int sum_qs1 = (int)bk->bsums[2 * sub_block]     + (int)bk->bsums[2 * sub_block + 1];
+                int sum_qs2 = (int)bk->bsums[2 * sub_block + 2] + (int)bk->bsums[2 * sub_block + 3];
+                macc += mr1 * sum_qs1 + mr2 * sum_qs2;
+
+                int32x4_t acc1 = vdotq_s32(vdupq_n_s32(0), q1_0, vld1q_s8(qs_sub1));
+                acc1           = vdotq_s32(acc1,            q1_1, vld1q_s8(qs_sub1 + 16));
+                int32x4_t acc2 = vdotq_s32(vdupq_n_s32(0), q2_0, vld1q_s8(qs_sub2));
+                acc2           = vdotq_s32(acc2,            q2_1, vld1q_s8(qs_sub2 + 16));
+
+                bacc = vmlaq_n_s32(bacc, acc1, s1);
+                bacc = vmlaq_n_s32(bacc, acc2, s2);
+            };
+
+            accum_tok(b0, bacc0, macc0);
+            accum_tok(b1, bacc1, macc1);
+            accum_tok(b2, bacc2, macc2);
+            accum_tok(b3, bacc3, macc3);
+
+            q += 32;
+            sub_block += 2;
+        }
+
+        sum0 += (d * (float)vaddvq_s32(bacc0) - dmin * (float)macc0) * b0->d;
+        sum1 += (d * (float)vaddvq_s32(bacc1) - dmin * (float)macc1) * b1->d;
+        sum2 += (d * (float)vaddvq_s32(bacc2) - dmin * (float)macc2) * b2->d;
+        sum3 += (d * (float)vaddvq_s32(bacc3) - dmin * (float)macc3) * b3->d;
+#else
+        (void)b0; (void)b1; (void)b2; (void)b3; (void)q; (void)d; (void)dmin; (void)sub_block;
+        sum0 = dot_row_q4_k_sdot(row, q8_0, blocks_per_row);
+        sum1 = dot_row_q4_k_sdot(row, q8_1, blocks_per_row);
+        sum2 = dot_row_q4_k_sdot(row, q8_2, blocks_per_row);
+        sum3 = dot_row_q4_k_sdot(row, q8_3, blocks_per_row);
+        break;
+#endif
+    }
+
+    *out0 = sum0;
+    *out1 = sum1;
+    *out2 = sum2;
+    *out3 = sum3;
+}
+
+void matmul_q4_k(float *out, const void *W, const float *x,
+                 int n_tokens, int n_out, int n_in, BlockQ8_K *q8_buf) {
+    if (n_tokens <= 0) return;
+    if (n_tokens == 1) {
+        matvec_q4_k(out, W, x, n_out, n_in, q8_buf);
+        return;
+    }
+
+    const BlockQ4_K *blocks = (const BlockQ4_K *)W;
+    int blocks_per_row = n_in / 256;
+
+    if (!q8_buf) {
+        static thread_local BlockQ8_K fallback[64 * 32];
+        q8_buf = fallback;
+    }
+
+    for (int t = 0; t < n_tokens; t++) {
+        quantize_q8_k(x + (size_t)t * n_in, q8_buf + (size_t)t * blocks_per_row, n_in);
+    }
+
+    auto worker = [&](int row_start, int row_end) {
+        for (int i = row_start; i < row_end; i++) {
+            const BlockQ4_K *row = blocks + (size_t)i * blocks_per_row;
+            int t = 0;
+            for (; t + 4 <= n_tokens; t += 4) {
+                float o0, o1, o2, o3;
+                dot_row_q4_k_batch4_sdot(
+                    &o0, &o1, &o2, &o3, row,
+                    q8_buf + (size_t)(t + 0) * blocks_per_row,
+                    q8_buf + (size_t)(t + 1) * blocks_per_row,
+                    q8_buf + (size_t)(t + 2) * blocks_per_row,
+                    q8_buf + (size_t)(t + 3) * blocks_per_row,
+                    blocks_per_row);
+                out[(size_t)(t + 0) * n_out + i] = o0;
+                out[(size_t)(t + 1) * n_out + i] = o1;
+                out[(size_t)(t + 2) * n_out + i] = o2;
+                out[(size_t)(t + 3) * n_out + i] = o3;
+            }
+            for (; t < n_tokens; t++) {
+                out[(size_t)t * n_out + i] = dot_row_q4_k_sdot(
+                    row, q8_buf + (size_t)t * blocks_per_row, blocks_per_row);
+            }
+        }
+    };
+
+    parallel_rows(n_out, worker);
+}
+
+void matmul_q4_k_gate_up(float *out_gate, float *out_up,
+                         const void *W_gate, const void *W_up,
+                         const float *x, int n_tokens, int n_out, int n_in, BlockQ8_K *q8_buf) {
+    if (n_tokens <= 0) return;
+    if (n_tokens == 1) {
+        matvec_q4_k_gate_up(out_gate, out_up, W_gate, W_up, x, n_out, n_in, q8_buf);
+        return;
+    }
+
+    const BlockQ4_K *blocks_gate = (const BlockQ4_K *)W_gate;
+    const BlockQ4_K *blocks_up   = (const BlockQ4_K *)W_up;
+    int blocks_per_row = n_in / 256;
+
+    if (!q8_buf) {
+        static thread_local BlockQ8_K fallback[64 * 32];
+        q8_buf = fallback;
+    }
+
+    for (int t = 0; t < n_tokens; t++) {
+        quantize_q8_k(x + (size_t)t * n_in, q8_buf + (size_t)t * blocks_per_row, n_in);
+    }
+
+    auto worker = [&](int row_start, int row_end) {
+        for (int i = row_start; i < row_end; i++) {
+            const BlockQ4_K *row_gate = blocks_gate + (size_t)i * blocks_per_row;
+            const BlockQ4_K *row_up   = blocks_up   + (size_t)i * blocks_per_row;
+            int t = 0;
+            for (; t + 4 <= n_tokens; t += 4) {
+                const BlockQ8_K *q0 = q8_buf + (size_t)(t + 0) * blocks_per_row;
+                const BlockQ8_K *q1 = q8_buf + (size_t)(t + 1) * blocks_per_row;
+                const BlockQ8_K *q2 = q8_buf + (size_t)(t + 2) * blocks_per_row;
+                const BlockQ8_K *q3 = q8_buf + (size_t)(t + 3) * blocks_per_row;
+
+                float g0, g1, g2, g3;
+                dot_row_q4_k_batch4_sdot(&g0, &g1, &g2, &g3, row_gate, q0, q1, q2, q3, blocks_per_row);
+                out_gate[(size_t)(t + 0) * n_out + i] = g0;
+                out_gate[(size_t)(t + 1) * n_out + i] = g1;
+                out_gate[(size_t)(t + 2) * n_out + i] = g2;
+                out_gate[(size_t)(t + 3) * n_out + i] = g3;
+
+                float u0, u1, u2, u3;
+                dot_row_q4_k_batch4_sdot(&u0, &u1, &u2, &u3, row_up, q0, q1, q2, q3, blocks_per_row);
+                out_up[(size_t)(t + 0) * n_out + i] = u0;
+                out_up[(size_t)(t + 1) * n_out + i] = u1;
+                out_up[(size_t)(t + 2) * n_out + i] = u2;
+                out_up[(size_t)(t + 3) * n_out + i] = u3;
+            }
+            for (; t < n_tokens; t++) {
+                const BlockQ8_K *qt = q8_buf + (size_t)t * blocks_per_row;
+                out_gate[(size_t)t * n_out + i] = dot_row_q4_k_sdot(row_gate, qt, blocks_per_row);
+                out_up[(size_t)t * n_out + i]   = dot_row_q4_k_sdot(row_up,   qt, blocks_per_row);
+            }
+        }
+    };
+
+    parallel_rows(n_out, worker);
+}
+
 // ── Fused Quantized Matrix-Vector Multiply (Q6_K) ──
 template <DiagMode Mode>
 static void matvec_q6_k_impl(float *out, const void *W, const float *x, int n_out, int n_in, BlockQ8_K *q8_buf = nullptr) {
@@ -512,6 +713,246 @@ void matvec_q6_k_diag(float *out, const void *W, const float *x, int n_out, int 
 
 void matvec_q6_k(float *out, const void *W, const float *x, int n_out, int n_in, BlockQ8_K *q8_buf) {
     matvec_q6_k_impl<DiagMode::NORMAL>(out, W, x, n_out, n_in, q8_buf);
+}
+
+static inline float dot_row_q6_k_sdot(const BlockQ6_K *row, const BlockQ8_K *q8_buf, int blocks_per_row) {
+    float row_sum = 0.0f;
+    for (int b = 0; b < blocks_per_row; b++) {
+        const BlockQ6_K *block = &row[b];
+        const BlockQ8_K *q8 = &q8_buf[b];
+        float d = f16_to_f32(block->d);
+
+        const uint8_t *ql = block->ql;
+        const uint8_t *qh = block->qh;
+        const int8_t  *sc = block->scales;
+
+#if defined(__ARM_FEATURE_DOTPROD)
+        int32x4_t block_acc = vdupq_n_s32(0);
+        uint8x16_t mask_0f  = vdupq_n_u8(0x0F);
+        uint8x16_t mask_03  = vdupq_n_u8(0x03);
+        int8x16_t c32       = vdupq_n_s8(32);
+
+        for (int half = 0; half < 2; half++) {
+            const int8_t *qs_half = q8->qs + half * 128;
+
+            for (int l = 0; l < 32; l += 16) {
+                int is = l / 16;
+
+                uint8x16_t ql_a = vld1q_u8(ql + l);
+                uint8x16_t ql_b = vld1q_u8(ql + l + 32);
+                uint8x16_t qh_v = vld1q_u8(qh + l);
+
+                int8x16_t q1 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(
+                    vandq_u8(ql_a, mask_0f),
+                    vshlq_n_u8(vandq_u8(qh_v, mask_03), 4))), c32);
+
+                int8x16_t q2 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(
+                    vandq_u8(ql_b, mask_0f),
+                    vshlq_n_u8(vandq_u8(vshrq_n_u8(qh_v, 2), mask_03), 4))), c32);
+
+                int8x16_t q3 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(
+                    vshrq_n_u8(ql_a, 4),
+                    vshlq_n_u8(vandq_u8(vshrq_n_u8(qh_v, 4), mask_03), 4))), c32);
+
+                int8x16_t q4 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(
+                    vshrq_n_u8(ql_b, 4),
+                    vshlq_n_u8(vshrq_n_u8(qh_v, 6), 4))), c32);
+
+                int32x4_t dot1 = vdotq_s32(vdupq_n_s32(0), q1, vld1q_s8(qs_half + l + 0));
+                int32x4_t dot2 = vdotq_s32(vdupq_n_s32(0), q2, vld1q_s8(qs_half + l + 32));
+                int32x4_t dot3 = vdotq_s32(vdupq_n_s32(0), q3, vld1q_s8(qs_half + l + 64));
+                int32x4_t dot4 = vdotq_s32(vdupq_n_s32(0), q4, vld1q_s8(qs_half + l + 96));
+
+                block_acc = vmlaq_n_s32(block_acc, dot1, (int32_t)sc[is + 0]);
+                block_acc = vmlaq_n_s32(block_acc, dot2, (int32_t)sc[is + 2]);
+                block_acc = vmlaq_n_s32(block_acc, dot3, (int32_t)sc[is + 4]);
+                block_acc = vmlaq_n_s32(block_acc, dot4, (int32_t)sc[is + 6]);
+            }
+
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+
+        int32_t block_int_sum = vaddvq_s32(block_acc);
+#else
+        int32_t block_int_sum = 0;
+        for (int half = 0; half < 2; half++) {
+            const int8_t *qs_half = q8->qs + half * 128;
+            for (int l = 0; l < 32; l++) {
+                int is = l / 16;
+                int8_t q1 = (int8_t)((ql[l]      & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                int8_t q3 = (int8_t)((ql[l]      >> 4)  | (((qh[l] >> 4) & 3) << 4)) - 32;
+                int8_t q4 = (int8_t)((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4)) - 32;
+
+                block_int_sum += (int32_t)q1 * (int32_t)qs_half[l +  0] * (int32_t)sc[is + 0];
+                block_int_sum += (int32_t)q2 * (int32_t)qs_half[l + 32] * (int32_t)sc[is + 2];
+                block_int_sum += (int32_t)q3 * (int32_t)qs_half[l + 64] * (int32_t)sc[is + 4];
+                block_int_sum += (int32_t)q4 * (int32_t)qs_half[l + 96] * (int32_t)sc[is + 6];
+            }
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+#endif
+        row_sum += (float)block_int_sum * (d * q8->d);
+    }
+    return row_sum;
+}
+
+static inline void dot_row_q6_k_batch4_sdot(
+    float *out0, float *out1, float *out2, float *out3,
+    const BlockQ6_K *row,
+    const BlockQ8_K *q8_0, const BlockQ8_K *q8_1,
+    const BlockQ8_K *q8_2, const BlockQ8_K *q8_3,
+    int blocks_per_row) {
+
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; b++) {
+        const BlockQ6_K *block = &row[b];
+        const BlockQ8_K *b0 = &q8_0[b];
+        const BlockQ8_K *b1 = &q8_1[b];
+        const BlockQ8_K *b2 = &q8_2[b];
+        const BlockQ8_K *b3 = &q8_3[b];
+        float d = f16_to_f32(block->d);
+
+        const uint8_t *ql = block->ql;
+        const uint8_t *qh = block->qh;
+        const int8_t  *sc = block->scales;
+
+#if defined(__ARM_FEATURE_DOTPROD)
+        int32x4_t bacc0 = vdupq_n_s32(0);
+        int32x4_t bacc1 = vdupq_n_s32(0);
+        int32x4_t bacc2 = vdupq_n_s32(0);
+        int32x4_t bacc3 = vdupq_n_s32(0);
+        uint8x16_t mask_0f = vdupq_n_u8(0x0F);
+        uint8x16_t mask_03 = vdupq_n_u8(0x03);
+        int8x16_t c32      = vdupq_n_s8(32);
+
+        for (int half = 0; half < 2; half++) {
+            int half_off = half * 128;
+
+            for (int l = 0; l < 32; l += 16) {
+                int is = l / 16;
+
+                // Load and unpack 64 6-bit weights ONCE for all 4 tokens
+                uint8x16_t ql_a = vld1q_u8(ql + l);
+                uint8x16_t ql_b = vld1q_u8(ql + l + 32);
+                uint8x16_t qh_v = vld1q_u8(qh + l);
+
+                int8x16_t q1 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(
+                    vandq_u8(ql_a, mask_0f),
+                    vshlq_n_u8(vandq_u8(qh_v, mask_03), 4))), c32);
+
+                int8x16_t q2 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(
+                    vandq_u8(ql_b, mask_0f),
+                    vshlq_n_u8(vandq_u8(vshrq_n_u8(qh_v, 2), mask_03), 4))), c32);
+
+                int8x16_t q3 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(
+                    vshrq_n_u8(ql_a, 4),
+                    vshlq_n_u8(vandq_u8(vshrq_n_u8(qh_v, 4), mask_03), 4))), c32);
+
+                int8x16_t q4 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(
+                    vshrq_n_u8(ql_b, 4),
+                    vshlq_n_u8(vshrq_n_u8(qh_v, 6), 4))), c32);
+
+                int32_t s0 = (int32_t)sc[is + 0];
+                int32_t s2 = (int32_t)sc[is + 2];
+                int32_t s4 = (int32_t)sc[is + 4];
+                int32_t s6 = (int32_t)sc[is + 6];
+
+                auto accum_tok = [&](const BlockQ8_K *bk, int32x4_t &bacc) {
+                    const int8_t *qs_half = bk->qs + half_off + l;
+                    int32x4_t dot1 = vdotq_s32(vdupq_n_s32(0), q1, vld1q_s8(qs_half + 0));
+                    int32x4_t dot2 = vdotq_s32(vdupq_n_s32(0), q2, vld1q_s8(qs_half + 32));
+                    int32x4_t dot3 = vdotq_s32(vdupq_n_s32(0), q3, vld1q_s8(qs_half + 64));
+                    int32x4_t dot4 = vdotq_s32(vdupq_n_s32(0), q4, vld1q_s8(qs_half + 96));
+
+                    bacc = vmlaq_n_s32(bacc, dot1, s0);
+                    bacc = vmlaq_n_s32(bacc, dot2, s2);
+                    bacc = vmlaq_n_s32(bacc, dot3, s4);
+                    bacc = vmlaq_n_s32(bacc, dot4, s6);
+                };
+
+                accum_tok(b0, bacc0);
+                accum_tok(b1, bacc1);
+                accum_tok(b2, bacc2);
+                accum_tok(b3, bacc3);
+            }
+
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+
+        sum0 += (float)vaddvq_s32(bacc0) * (d * b0->d);
+        sum1 += (float)vaddvq_s32(bacc1) * (d * b1->d);
+        sum2 += (float)vaddvq_s32(bacc2) * (d * b2->d);
+        sum3 += (float)vaddvq_s32(bacc3) * (d * b3->d);
+#else
+        (void)b0; (void)b1; (void)b2; (void)b3; (void)d; (void)ql; (void)qh; (void)sc;
+        sum0 = dot_row_q6_k_sdot(row, q8_0, blocks_per_row);
+        sum1 = dot_row_q6_k_sdot(row, q8_1, blocks_per_row);
+        sum2 = dot_row_q6_k_sdot(row, q8_2, blocks_per_row);
+        sum3 = dot_row_q6_k_sdot(row, q8_3, blocks_per_row);
+        break;
+#endif
+    }
+
+    *out0 = sum0;
+    *out1 = sum1;
+    *out2 = sum2;
+    *out3 = sum3;
+}
+
+void matmul_q6_k(float *out, const void *W, const float *x,
+                 int n_tokens, int n_out, int n_in, BlockQ8_K *q8_buf) {
+    if (n_tokens <= 0) return;
+    if (n_tokens == 1) {
+        matvec_q6_k(out, W, x, n_out, n_in, q8_buf);
+        return;
+    }
+
+    const BlockQ6_K *blocks = (const BlockQ6_K *)W;
+    int blocks_per_row = n_in / 256;
+
+    if (!q8_buf) {
+        static thread_local BlockQ8_K fallback[64 * 32];
+        q8_buf = fallback;
+    }
+
+    for (int t = 0; t < n_tokens; t++) {
+        quantize_q8_k(x + (size_t)t * n_in, q8_buf + (size_t)t * blocks_per_row, n_in);
+    }
+
+    auto worker = [&](int row_start, int row_end) {
+        for (int i = row_start; i < row_end; i++) {
+            const BlockQ6_K *row = blocks + (size_t)i * blocks_per_row;
+            int t = 0;
+            for (; t + 4 <= n_tokens; t += 4) {
+                float o0, o1, o2, o3;
+                dot_row_q6_k_batch4_sdot(
+                    &o0, &o1, &o2, &o3, row,
+                    q8_buf + (size_t)(t + 0) * blocks_per_row,
+                    q8_buf + (size_t)(t + 1) * blocks_per_row,
+                    q8_buf + (size_t)(t + 2) * blocks_per_row,
+                    q8_buf + (size_t)(t + 3) * blocks_per_row,
+                    blocks_per_row);
+                out[(size_t)(t + 0) * n_out + i] = o0;
+                out[(size_t)(t + 1) * n_out + i] = o1;
+                out[(size_t)(t + 2) * n_out + i] = o2;
+                out[(size_t)(t + 3) * n_out + i] = o3;
+            }
+            for (; t < n_tokens; t++) {
+                out[(size_t)t * n_out + i] = dot_row_q6_k_sdot(
+                    row, q8_buf + (size_t)t * blocks_per_row, blocks_per_row);
+            }
+        }
+    };
+
+    parallel_rows(n_out, worker);
 }
 
 // ── Softmax ──

@@ -130,5 +130,46 @@ int main() {
     // 3. FFN Down Projection: 2048 x 5632
     benchmark_layer("FFN Down (ffn_down)", 2048, 5632);
 
+    // 4. Batched GEMM (matmul_q4_k & matmul_q6_k) scaling across B in {1, 2, 4, 8, 16}
+    {
+        const int n_out = 5632, n_in = 2048, iters = 30;
+        const int n_blocks = (n_out * n_in) / 256;
+        std::vector<BlockQ4_K> W4(n_blocks);
+        std::vector<BlockQ6_K> W6(n_blocks);
+        for (int b = 0; b < n_blocks; b++) {
+            W4[b].d = 0x3800; W4[b].dmin = 0x3400;
+            W6[b].d = 0x3800;
+        }
+        printf("=== Batched GEMM Throughput (5632 x 2048) ===\n");
+        const int batch_sizes[] = {1, 2, 4, 8, 16};
+        for (int B : batch_sizes) {
+            std::vector<float> X(B * n_in, 1.0f);
+            std::vector<float> Y(B * n_out);
+            matmul_q4_k(Y.data(), W4.data(), X.data(), B, n_out, n_in);
+            auto t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < iters; i++) {
+                matmul_q4_k(Y.data(), W4.data(), X.data(), B, n_out, n_in);
+            }
+            auto t1 = std::chrono::high_resolution_clock::now();
+            double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+            double ms_per_tok = total_ms / B;
+            double gflops = (2.0 * B * n_out * n_in) / (total_ms * 1e-3) / 1e9;
+
+            matmul_q6_k(Y.data(), W6.data(), X.data(), B, n_out, n_in);
+            auto t2 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < iters; i++) {
+                matmul_q6_k(Y.data(), W6.data(), X.data(), B, n_out, n_in);
+            }
+            auto t3 = std::chrono::high_resolution_clock::now();
+            double total6_ms = std::chrono::duration<double, std::milli>(t3 - t2).count() / iters;
+            double ms6_per_tok = total6_ms / B;
+            double gflops6 = (2.0 * B * n_out * n_in) / (total6_ms * 1e-3) / 1e9;
+
+            printf("  B=%2d | Q4_K: %6.3f ms (%5.3f ms/tok, %6.1f GFLOP/s) | Q6_K: %6.3f ms (%5.3f ms/tok, %6.1f GFLOP/s)\n",
+                   B, total_ms, ms_per_tok, gflops, total6_ms, ms6_per_tok, gflops6);
+        }
+        printf("\n");
+    }
+
     return 0;
 }

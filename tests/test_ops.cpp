@@ -313,11 +313,119 @@ static void test_mha_decode() {
     }
 }
 
+static void test_matmul_q4_k() {
+    printf("Testing matmul_q4_k (B in {1, 2, 4, 8, 16})... ");
+
+    const int n_out = 64;
+    const int n_in = 512; // 2 super-blocks of 256 per row
+    const int n_blocks = (n_out * n_in) / 256;
+
+    std::vector<BlockQ4_K> blocks(n_blocks);
+    for (int b = 0; b < n_blocks; b++) {
+        blocks[b].d = 0x3800;    // 0.5f in f16
+        blocks[b].dmin = 0x3400; // 0.25f in f16
+        for (int i = 0; i < 12; i++) {
+            blocks[b].scales[i] = (uint8_t)((b * 7 + i * 13) & 0x3F);
+        }
+        for (int i = 0; i < 128; i++) {
+            blocks[b].quants[i] = (uint8_t)((b * 17 + i * 29) & 0xFF);
+        }
+    }
+
+    const int batch_sizes[] = {1, 2, 4, 8, 16};
+    float max_diff = 0.0f;
+
+    for (int B : batch_sizes) {
+        std::vector<float> X(B * n_in);
+        for (int t = 0; t < B; t++) {
+            for (int j = 0; j < n_in; j++) {
+                X[t * n_in + j] = sinf((float)(t * 37 + j) * 0.13f + 0.5f);
+            }
+        }
+
+        // Reference: token-by-token matvec_q4_k
+        std::vector<float> out_ref(B * n_out);
+        for (int t = 0; t < B; t++) {
+            matvec_q4_k(out_ref.data() + t * n_out, blocks.data(), X.data() + t * n_in, n_out, n_in);
+        }
+
+        // Batched matmul_q4_k
+        std::vector<float> out_test(B * n_out);
+        matmul_q4_k(out_test.data(), blocks.data(), X.data(), B, n_out, n_in);
+
+        for (int i = 0; i < B * n_out; i++) {
+            float diff = fabsf(out_ref[i] - out_test[i]);
+            if (diff > max_diff) max_diff = diff;
+        }
+    }
+
+    printf("max diff = %e -> %s\n", max_diff, (max_diff < 1e-5f) ? "PASS" : "FAIL");
+    if (max_diff >= 1e-5f) {
+        exit(1);
+    }
+}
+
+static void test_matmul_q6_k() {
+    printf("Testing matmul_q6_k (B in {1, 2, 4, 8, 16})... ");
+
+    const int n_out = 64;
+    const int n_in = 512; // 2 super-blocks of 256 per row
+    const int n_blocks = (n_out * n_in) / 256;
+
+    std::vector<BlockQ6_K> blocks(n_blocks);
+    for (int b = 0; b < n_blocks; b++) {
+        blocks[b].d = 0x3800; // 0.5f in f16
+        for (int i = 0; i < 128; i++) {
+            blocks[b].ql[i] = (uint8_t)((b * 13 + i * 17) & 0xFF);
+        }
+        for (int i = 0; i < 64; i++) {
+            blocks[b].qh[i] = (uint8_t)((b * 7 + i * 23) & 0xFF);
+        }
+        for (int i = 0; i < 16; i++) {
+            blocks[b].scales[i] = (int8_t)((b * 5 + i * 11) % 64 - 32);
+        }
+    }
+
+    const int batch_sizes[] = {1, 2, 4, 8, 16};
+    float max_diff = 0.0f;
+
+    for (int B : batch_sizes) {
+        std::vector<float> X(B * n_in);
+        for (int t = 0; t < B; t++) {
+            for (int j = 0; j < n_in; j++) {
+                X[t * n_in + j] = cosf((float)(t * 41 + j) * 0.11f + 0.3f);
+            }
+        }
+
+        // Reference: token-by-token matvec_q6_k
+        std::vector<float> out_ref(B * n_out);
+        for (int t = 0; t < B; t++) {
+            matvec_q6_k(out_ref.data() + t * n_out, blocks.data(), X.data() + t * n_in, n_out, n_in);
+        }
+
+        // Batched matmul_q6_k
+        std::vector<float> out_test(B * n_out);
+        matmul_q6_k(out_test.data(), blocks.data(), X.data(), B, n_out, n_in);
+
+        for (int i = 0; i < B * n_out; i++) {
+            float diff = fabsf(out_ref[i] - out_test[i]);
+            if (diff > max_diff) max_diff = diff;
+        }
+    }
+
+    printf("max diff = %e -> %s\n", max_diff, (max_diff < 1e-5f) ? "PASS" : "FAIL");
+    if (max_diff >= 1e-5f) {
+        exit(1);
+    }
+}
+
 int main() {
     test_quantize_q8_k();
     test_matvec_q8_0();
     test_matvec_q4_k();
     test_matvec_q6_k();
     test_mha_decode();
+    test_matmul_q4_k();
+    test_matmul_q6_k();
     return 0;
 }
