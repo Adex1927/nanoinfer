@@ -46,7 +46,7 @@ int main(int argc, char **argv) {
             prompt.push_back(atoi(argv[i]));
         }
     } else {
-        const char *path = getenv("NANO_PROMPT_FILE") ? getenv("NANO_PROMPT_FILE") : "prompt.txt";
+        const char *path = getenv("NANO_PROMPT_FILE") ? getenv("NANO_PROMPT_FILE") : "prompts/prompt.txt";
         std::string text = read_text_file(path);
         if (text.empty()) {
             fprintf(stderr, "ERROR: no token IDs given and could not read a prompt from '%s'\n", path);

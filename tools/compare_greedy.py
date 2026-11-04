@@ -32,7 +32,7 @@ DEFAULT_LLAMA_DIR = os.path.expanduser("~/workspace/llama.cpp")
 DEFAULT_COMPLETION = os.path.join(DEFAULT_LLAMA_DIR, "build/bin/llama-completion")
 DEFAULT_TOKENIZE = os.path.join(DEFAULT_LLAMA_DIR, "build/bin/llama-tokenize")
 DEFAULT_NANOINFER = os.path.join(REPO_ROOT, "model_test")
-DEFAULT_PROMPT_FILE = os.path.join(REPO_ROOT, "prompt.txt")
+DEFAULT_PROMPT_FILE = os.path.join(REPO_ROOT, "prompts", "prompt.txt")
 
 
 def read_prompt_file(path):

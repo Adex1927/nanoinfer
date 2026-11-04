@@ -39,7 +39,7 @@ from array import array
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LLAMA_BIN = os.path.expanduser("~/workspace/llama.cpp/build/bin")
 DEFAULT_NANOINFER = os.path.join(REPO_ROOT, "model_test")
-DEFAULT_PROMPT_FILE = os.path.join(REPO_ROOT, "prompt.txt")
+DEFAULT_PROMPT_FILE = os.path.join(REPO_ROOT, "prompts", "prompt.txt")
 
 # No trailing newline (model_test strips one, like llama.cpp -f) and no backslashes.
 TOKENIZER_CASES = [

@@ -265,10 +265,14 @@ void prefill(LlamaModel *llama, InferState *s, const int *tokens, int n_tokens) 
 
     probe_set_pos(-1);
     Probe p_prefill("prefill_total");
+    ProbeAccum pa_forward("prefill:forward_token");
     for (int pos = 0; pos < n_tokens; pos++) {
         bool need_logits = (pos == n_tokens - 1);
+        auto t = pa_forward.start();
         forward_token(llama, s, tokens[pos], pos, need_logits);
+        pa_forward.stop(t);
     }
+    probe_set_pos(-1);
     // p_prefill destructor fires here → prints total prefill wall time
 }
 
