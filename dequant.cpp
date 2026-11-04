@@ -3,49 +3,6 @@
 #include <cmath>
 #include <cstring>
 
-// ── f16_to_f32 ──
-// IEEE 754 float16: [1 sign][5 exponent][10 mantissa]
-// IEEE 754 float32: [1 sign][8 exponent][23 mantissa]
-// We need to re-pack the bits from the smaller format into the larger one.
-
-float f16_to_f32(uint16_t h) {
-    uint32_t sign = (h >> 15) & 0x1;          // top bit
-    uint32_t exp  = (h >> 10) & 0x1F;         // next 5 bits
-    uint32_t mant = h & 0x3FF;                // bottom 10 bits
-
-    uint32_t result;
-
-    if (exp == 0) {
-        if (mant == 0) {
-            // true zero (±0)
-            result = sign << 31;
-        } else {
-            // subnormal: value = (-1)^sign × (mant / 1024) × 2^(-14)
-            // normalize: shift mantissa left until the implicit 1 bit is in place
-            exp = 113;  // 127 - 14 = 113, then we'll subtract as we shift
-            while (!(mant & 0x400)) {
-                mant <<= 1;
-                exp--;
-            }
-            mant &= 0x3FF;  // remove the implicit 1 bit
-            result = (sign << 31) | (exp << 23) | (mant << 13);
-        }
-    } else if (exp == 0x1F) {
-        // inf or NaN — extend to float32
-        result = (sign << 31) | (0xFF << 23) | (mant << 13);
-    } else {
-        // normal number:
-        // float16 exponent bias is 15, float32 bias is 127
-        // so we adjust: new_exp = exp - 15 + 127 = exp + 112
-        result = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
-    }
-
-    // type-pun the uint32 bits into a float
-    float f;
-    __builtin_memcpy(&f, &result, sizeof(f));
-    return f;
-}
-
 // ── dequantize_q8_0 ──
 // The simplest one. Each block = 34 bytes = [float16 scale][32 × int8]
 // For each weight: float_value = scale * quant_value

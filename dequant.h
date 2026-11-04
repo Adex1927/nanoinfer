@@ -84,7 +84,35 @@ static inline void get_scale_min_k4(int j, const uint8_t *scales, uint8_t *sc, u
 // ── API ──
 
 // Convert float16 (as stored in GGUF) to float32
-float f16_to_f32(uint16_t h);
+static inline float f16_to_f32(uint16_t h) {
+#if defined(__ARM_NEON)
+    __fp16 f16;
+    __builtin_memcpy(&f16, &h, sizeof(f16));
+    return (float)f16;
+#else
+    uint32_t sign = (h >> 15) & 0x1;
+    uint32_t exp  = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+    uint32_t result;
+    if (exp == 0) {
+        if (mant == 0) {
+            result = sign << 31;
+        } else {
+            exp = 113;
+            while (!(mant & 0x400)) { mant <<= 1; exp--; }
+            mant &= 0x3FF;
+            result = (sign << 31) | (exp << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1F) {
+        result = (sign << 31) | (0xFF << 23) | (mant << 13);
+    } else {
+        result = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+    }
+    float f;
+    __builtin_memcpy(&f, &result, sizeof(f));
+    return f;
+#endif
+}
 
 // Dequantize a Q8_0 tensor: reads n_elements from src, writes floats to dst.
 // dst must be pre-allocated with n_elements floats.
