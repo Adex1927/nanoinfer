@@ -168,29 +168,29 @@ static inline float dot_row_q4_k_sdot(const BlockQ4_K *row, const BlockQ8_K *q8_
         float dmin = f16_to_f32(block->dmin);
 
         int sub_block = 0;
-        float super_sum = 0.0f;
+
+#if defined(__ARM_FEATURE_DOTPROD)
+        int32x4_t block_acc = vdupq_n_s32(0);
+        int32_t   min_acc   = 0;
+        uint8x16_t mask_0f  = vdupq_n_u8(0x0F);
 
         for (int chunk = 0; chunk < 256; chunk += 64) {
             uint8_t sc1, m1_raw, sc2, m2_raw;
             get_scale_min_k4(sub_block, block->scales, &sc1, &m1_raw);
             get_scale_min_k4(sub_block + 1, block->scales, &sc2, &m2_raw);
-            float d1 = d * sc1;
-            float m1 = dmin * m1_raw;
-            float d2 = d * sc2;
-            float m2 = dmin * m2_raw;
 
             const int8_t *qs_sub1 = q8->qs + chunk;
             const int8_t *qs_sub2 = q8->qs + chunk + 32;
 
             int sum_qs1 = (int)q8->bsums[2 * sub_block]     + (int)q8->bsums[2 * sub_block + 1];
             int sum_qs2 = (int)q8->bsums[2 * sub_block + 2] + (int)q8->bsums[2 * sub_block + 3];
+            min_acc += (int32_t)m1_raw * sum_qs1 + (int32_t)m2_raw * sum_qs2;
 
-#if defined(__ARM_FEATURE_DOTPROD)
             uint8x16_t bytes0 = vld1q_u8(q);
             uint8x16_t bytes1 = vld1q_u8(q + 16);
 
-            int8x16_t q1_0 = vreinterpretq_s8_u8(vandq_u8(bytes0, vdupq_n_u8(0x0F)));
-            int8x16_t q1_1 = vreinterpretq_s8_u8(vandq_u8(bytes1, vdupq_n_u8(0x0F)));
+            int8x16_t q1_0 = vreinterpretq_s8_u8(vandq_u8(bytes0, mask_0f));
+            int8x16_t q1_1 = vreinterpretq_s8_u8(vandq_u8(bytes1, mask_0f));
 
             int8x16_t q2_0 = vreinterpretq_s8_u8(vshrq_n_u8(bytes0, 4));
             int8x16_t q2_1 = vreinterpretq_s8_u8(vshrq_n_u8(bytes1, 4));
@@ -206,16 +206,38 @@ static inline float dot_row_q4_k_sdot(const BlockQ4_K *row, const BlockQ8_K *q8_
             int32x4_t acc2 = vdotq_s32(vdupq_n_s32(0), q2_0, ax2_0);
             acc2           = vdotq_s32(acc2,            q2_1, ax2_1);
 
-            int32_t dot1 = vaddvq_s32(acc1);
-            int32_t dot2 = vaddvq_s32(acc2);
+            block_acc = vmlaq_n_s32(block_acc, acc1, (int32_t)sc1);
+            block_acc = vmlaq_n_s32(block_acc, acc2, (int32_t)sc2);
+
+            q += 32;
+            sub_block += 2;
+        }
+
+        float super_sum = d * (float)vaddvq_s32(block_acc) - dmin * (float)min_acc;
+        row_sum += super_sum * q8->d;
 #else
+        float super_sum = 0.0f;
+        for (int chunk = 0; chunk < 256; chunk += 64) {
+            uint8_t sc1, m1_raw, sc2, m2_raw;
+            get_scale_min_k4(sub_block, block->scales, &sc1, &m1_raw);
+            get_scale_min_k4(sub_block + 1, block->scales, &sc2, &m2_raw);
+            float d1 = d * sc1;
+            float m1 = dmin * m1_raw;
+            float d2 = d * sc2;
+            float m2 = dmin * m2_raw;
+
+            const int8_t *qs_sub1 = q8->qs + chunk;
+            const int8_t *qs_sub2 = q8->qs + chunk + 32;
+
+            int sum_qs1 = (int)q8->bsums[2 * sub_block]     + (int)q8->bsums[2 * sub_block + 1];
+            int sum_qs2 = (int)q8->bsums[2 * sub_block + 2] + (int)q8->bsums[2 * sub_block + 3];
+
             int32_t dot1 = 0;
             int32_t dot2 = 0;
             for (int l = 0; l < 32; l++) {
                 dot1 += (int32_t)(q[l] & 0x0F) * (int32_t)qs_sub1[l];
                 dot2 += (int32_t)(q[l] >> 4)   * (int32_t)qs_sub2[l];
             }
-#endif
             super_sum += (d1 * (float)dot1 - m1 * (float)sum_qs1);
             super_sum += (d2 * (float)dot2 - m2 * (float)sum_qs2);
 
@@ -224,6 +246,7 @@ static inline float dot_row_q4_k_sdot(const BlockQ4_K *row, const BlockQ8_K *q8_
         }
 
         row_sum += super_sum * q8->d;
+#endif
     }
     return row_sum;
 }
@@ -391,15 +414,14 @@ static void matvec_q6_k_impl(float *out, const void *W, const float *x, int n_ou
                 } else {
                     // Normal mode: SDOT
                     const BlockQ8_K *q8 = &q8_buf[b];
-                    int32_t block_int_sum = 0;
+#if defined(__ARM_FEATURE_DOTPROD)
+                    int32x4_t block_acc = vdupq_n_s32(0);
+                    uint8x16_t mask_0f  = vdupq_n_u8(0x0F);
+                    uint8x16_t mask_03  = vdupq_n_u8(0x03);
+                    int8x16_t c32       = vdupq_n_s8(32);
 
                     for (int half = 0; half < 2; half++) {
                         const int8_t *qs_half = q8->qs + half * 128;
-
-#if defined(__ARM_FEATURE_DOTPROD)
-                        uint8x16_t mask_0f = vdupq_n_u8(0x0F);
-                        uint8x16_t mask_03 = vdupq_n_u8(0x03);
-                        int8x16_t c32      = vdupq_n_s8(32);
 
                         for (int l = 0; l < 32; l += 16) {
                             int is = l / 16;
@@ -429,17 +451,28 @@ static void matvec_q6_k_impl(float *out, const void *W, const float *x, int n_ou
                             int8x16_t ax3 = vld1q_s8(qs_half + l + 64);
                             int8x16_t ax4 = vld1q_s8(qs_half + l + 96);
 
-                            int32_t dot1 = vaddvq_s32(vdotq_s32(vdupq_n_s32(0), q1, ax1));
-                            int32_t dot2 = vaddvq_s32(vdotq_s32(vdupq_n_s32(0), q2, ax2));
-                            int32_t dot3 = vaddvq_s32(vdotq_s32(vdupq_n_s32(0), q3, ax3));
-                            int32_t dot4 = vaddvq_s32(vdotq_s32(vdupq_n_s32(0), q4, ax4));
+                            int32x4_t dot1 = vdotq_s32(vdupq_n_s32(0), q1, ax1);
+                            int32x4_t dot2 = vdotq_s32(vdupq_n_s32(0), q2, ax2);
+                            int32x4_t dot3 = vdotq_s32(vdupq_n_s32(0), q3, ax3);
+                            int32x4_t dot4 = vdotq_s32(vdupq_n_s32(0), q4, ax4);
 
-                            block_int_sum += dot1 * (int32_t)sc[is + 0];
-                            block_int_sum += dot2 * (int32_t)sc[is + 2];
-                            block_int_sum += dot3 * (int32_t)sc[is + 4];
-                            block_int_sum += dot4 * (int32_t)sc[is + 6];
+                            block_acc = vmlaq_n_s32(block_acc, dot1, (int32_t)sc[is + 0]);
+                            block_acc = vmlaq_n_s32(block_acc, dot2, (int32_t)sc[is + 2]);
+                            block_acc = vmlaq_n_s32(block_acc, dot3, (int32_t)sc[is + 4]);
+                            block_acc = vmlaq_n_s32(block_acc, dot4, (int32_t)sc[is + 6]);
                         }
+
+                        ql += 64;
+                        qh += 32;
+                        sc += 8;
+                    }
+
+                    int32_t block_int_sum = vaddvq_s32(block_acc);
 #else
+                    int32_t block_int_sum = 0;
+
+                    for (int half = 0; half < 2; half++) {
+                        const int8_t *qs_half = q8->qs + half * 128;
                         for (int l = 0; l < 32; l++) {
                             int is = l / 16;
                             int8_t q1 = (int8_t)((ql[l]      & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
@@ -452,11 +485,11 @@ static void matvec_q6_k_impl(float *out, const void *W, const float *x, int n_ou
                             block_int_sum += (int32_t)q3 * (int32_t)qs_half[l + 64] * (int32_t)sc[is + 4];
                             block_int_sum += (int32_t)q4 * (int32_t)qs_half[l + 96] * (int32_t)sc[is + 6];
                         }
-#endif
                         ql += 64;
                         qh += 32;
                         sc += 8;
                     }
+#endif
 
                     row_sum += (float)block_int_sum * (d * q8->d);
                 }
