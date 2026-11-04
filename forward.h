@@ -44,16 +44,19 @@ void forward_layer(LlamaModel *llama, InferState *s, int layer, int pos,
 //   For TinyLlama: 32 Q heads / 4 KV heads = 8 Q heads per KV group.
 //
 void mha(InferState *s, int layer, int pos);
+void mha_batch(InferState *s, int layer, int start_pos, int n_tokens);
 
-// ── forward_token ──
-// Runs a full forward pass for a single token at sequence position `pos`:
-//   1. Embedding lookup: token id -> s->x
-//   2. Run through all N transformer layers (updates KV cache at `pos`)
-//   3. If need_logits is true: Final RMSNorm + output projection -> s->logits
+// ── forward_token / forward_batch ──
+// Runs a full forward pass for 1 token (forward_token) or a batch of n_tokens
+// contiguous tokens starting at sequence position `start_pos` (forward_batch):
+//   1. Embedding lookup: token ids -> s->x
+//   2. Run through all N transformer layers (updates KV cache at start_pos..start_pos+n_tokens-1)
+//   3. If need_logits is true: Final RMSNorm + output projection on the last token -> s->logits
 //
-// If need_logits is false (e.g. during prompt prefill before the last token),
-// step 3 is skipped to avoid dequantizing the giant output weight matrix.
+// If need_logits is false (e.g. during prompt prefill before the final chunk),
+// step 3 is skipped to avoid evaluating the output weight matrix.
 void forward_token(LlamaModel *llama, InferState *s, int token, int pos, bool need_logits);
+void forward_batch(LlamaModel *llama, InferState *s, const int *tokens, int n_tokens, int start_pos, bool need_logits);
 
 // ── prefill ──
 // Feeds a sequence of prompt tokens into the model to populate the KV cache.

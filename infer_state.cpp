@@ -21,27 +21,30 @@ InferState *alloc_infer_state(const LlamaHparams *hp) {
     s->n_ff       = (int)hp->n_ff;
     s->n_ctx      = (int)hp->n_ctx;
     s->n_vocab    = (int)hp->n_vocab;
+    s->max_batch  = InferState::MAX_BATCH;
 
-    // ── activation buffers (small — one vector per slot) ──
+    size_t B = (size_t)s->max_batch;
 
-    s->x      = (float *)calloc(s->n_embd, sizeof(float));
-    s->xb     = (float *)calloc(s->n_embd, sizeof(float));
-    s->xb2    = (float *)calloc(s->n_embd, sizeof(float));
+    // ── activation buffers (sized for up to max_batch tokens) ──
+
+    s->x      = (float *)calloc(B * s->n_embd, sizeof(float));
+    s->xb     = (float *)calloc(B * s->n_embd, sizeof(float));
+    s->xb2    = (float *)calloc(B * s->n_embd, sizeof(float));
 
     // ── attention buffers ──
 
-    s->q   = (float *)calloc(s->n_heads    * s->head_dim, sizeof(float));
-    s->k   = (float *)calloc(s->n_kv_heads * s->head_dim, sizeof(float));
-    s->v   = (float *)calloc(s->n_kv_heads * s->head_dim, sizeof(float));
+    s->q   = (float *)calloc(B * s->n_heads    * s->head_dim, sizeof(float));
+    s->k   = (float *)calloc(B * s->n_kv_heads * s->head_dim, sizeof(float));
+    s->v   = (float *)calloc(B * s->n_kv_heads * s->head_dim, sizeof(float));
 
     // att scores: n_heads rows, each row is n_ctx scores (one per past position).
     // During attention for head h at position pos, we fill att[h * n_ctx .. pos].
-    s->att = (float *)calloc(s->n_heads * s->n_ctx, sizeof(float));
+    s->att = (float *)calloc((size_t)s->n_heads * s->n_ctx, sizeof(float));
 
     // ── FFN buffer ──
 
-    s->hb  = (float *)calloc(s->n_ff, sizeof(float));
-    s->hb2 = (float *)calloc(s->n_ff, sizeof(float));
+    s->hb  = (float *)calloc(B * s->n_ff, sizeof(float));
+    s->hb2 = (float *)calloc(B * s->n_ff, sizeof(float));
 
     // ── output logits ──
 
@@ -64,7 +67,7 @@ InferState *alloc_infer_state(const LlamaHparams *hp) {
     // ── Quantized activation scratch buffer ──
     size_t max_n_in = (size_t)((s->n_embd > s->n_ff) ? s->n_embd : s->n_ff);
     size_t q8_blocks = (max_n_in + 255) / 256;
-    s->q8_buf = (BlockQ8_K *)calloc(q8_blocks, sizeof(BlockQ8_K));
+    s->q8_buf = (BlockQ8_K *)calloc(B * q8_blocks, sizeof(BlockQ8_K));
 
     // basic allocation check
     if (!s->x || !s->xb || !s->xb2 || !s->q || !s->k || !s->v ||

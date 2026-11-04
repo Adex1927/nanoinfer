@@ -42,21 +42,37 @@ def print_table(df):
     print(t.to_string())
 
 
-def per_token_breakdown(sub):
-    """ms per token, per stage (layer stages summed over layers)."""
+def chunk_sizes(index, phase):
+    """Return number of tokens processed at each recorded token_pos."""
+    if len(index) == 0:
+        return np.array([], dtype=float)
+    if phase == "prefill":
+        sizes = np.diff(index, prepend=-1).astype(float)
+        return np.maximum(sizes, 1.0)
+    return np.ones(len(index), dtype=float)
+
+
+def per_token_breakdown(sub, phase="decode"):
+    """ms per token, per stage (layer stages summed over layers, normalized by batch chunk size)."""
     parts = {}
     for st in LAYER_STAGES + TOKEN_STAGES:
         d = sub[sub.name == st]
         parts[st] = d.groupby("token_pos").ms.sum()
-    return pd.DataFrame(parts).fillna(0.0)
+    bd = pd.DataFrame(parts).fillna(0.0).sort_index()
+    if not bd.empty:
+        sizes = chunk_sizes(bd.index.values, phase)
+        bd = bd.div(sizes, axis=0)
+    return bd
 
 
 def step_series(sub, bd, phase):
-    """Return a Series of step latency indexed by token_pos."""
+    """Return a Series of per-token step latency indexed by token_pos."""
     probe_name = f"{phase}:forward_token"
     step = sub[sub.name == probe_name].sort_values("token_pos")
     if not step.empty:
-        return step.set_index("token_pos").ms
+        s = step.set_index("token_pos").ms.sort_index()
+        sizes = chunk_sizes(s.index.values, phase)
+        return s / sizes
     # Fallback for older CSVs without prefill:forward_token
     if not bd.empty:
         return bd.sum(axis=1).sort_index()
@@ -65,7 +81,7 @@ def step_series(sub, bd, phase):
 
 def plot_single_phase(ax, sub, phase):
     label_cap = phase.capitalize()
-    bd = per_token_breakdown(sub)
+    bd = per_token_breakdown(sub, phase)
     s = step_series(sub, bd, phase)
 
     # 1. step latency vs token position
@@ -125,8 +141,8 @@ def plot_single_phase(ax, sub, phase):
 def plot_both_phases(ax, df):
     pre = df[df.phase == "prefill"]
     dec = df[df.phase == "decode"]
-    bd_pre = per_token_breakdown(pre)
-    bd_dec = per_token_breakdown(dec)
+    bd_pre = per_token_breakdown(pre, "prefill")
+    bd_dec = per_token_breakdown(dec, "decode")
     s_pre = step_series(pre, bd_pre, "prefill")
     s_dec = step_series(dec, bd_dec, "decode")
 
@@ -150,17 +166,28 @@ def plot_both_phases(ax, df):
     stages = ( bd_dec.mean().sort_values().index if not bd_dec.empty
                else bd_pre.mean().sort_values().index )
     y_pos = np.arange(len(stages))
-    height = 0.38
+    height = 0.40
     pre_vals = bd_pre.mean().reindex(stages, fill_value=0.0).values if not bd_pre.empty else np.zeros(len(stages))
     dec_vals = bd_dec.mean().reindex(stages, fill_value=0.0).values if not bd_dec.empty else np.zeros(len(stages))
+    pre_sum = pre_vals.sum() if pre_vals.sum() > 0 else 1.0
+    dec_sum = dec_vals.sum() if dec_vals.sum() > 0 else 1.0
     ax[1].barh(y_pos + height / 2, pre_vals, height, label="prefill")
     ax[1].barh(y_pos - height / 2, dec_vals, height, label="decode")
+    for i, (p_ms, d_ms) in enumerate(zip(pre_vals, dec_vals)):
+        if not bd_pre.empty:
+            ax[1].text(p_ms, y_pos[i] + height / 2,
+                       f" {p_ms:.2f} ms ({100.0 * p_ms / pre_sum:.1f}%)",
+                       va="center", fontsize=6.5)
+        if not bd_dec.empty:
+            ax[1].text(d_ms, y_pos[i] - height / 2,
+                       f" {d_ms:.2f} ms ({100.0 * d_ms / dec_sum:.1f}%)",
+                       va="center", fontsize=6.5)
     ax[1].set_yticks(y_pos)
     ax[1].set_yticklabels(stages)
     max_v = max(pre_vals.max(initial=0.0), dec_vals.max(initial=0.0))
     if max_v > 0:
-        ax[1].set_xlim(right=max_v * 1.25)
-    ax[1].legend(fontsize=8)
+        ax[1].set_xlim(right=max_v * 1.38)
+    ax[1].legend(fontsize=8, loc="lower right")
     ax[1].set_title("Mean ms per token by stage (Prefill vs Decode)")
     ax[1].set_xlabel("ms (layer stages summed over layers)")
 

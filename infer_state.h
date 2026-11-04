@@ -21,27 +21,29 @@
 // Multiple sessions can share the same LlamaModel.
 
 struct InferState {
-    // ── per-token activation buffers ──
+    static constexpr int MAX_BATCH = 64;
 
-    float *x;       // [n_embd] — main residual stream (current token's state)
-    float *xb;      // [n_embd] — scratch: holds the normed x before attention/FFN
-    float *xb2;     // [n_embd] — scratch: projection result before residual add
-    BlockQ8_K *q8_buf; // [max(n_embd, n_ff) / 256] — quantized activations for SDOT GEMV
+    // ── activation buffers (sized for up to max_batch tokens) ──
+
+    float *x;       // [max_batch * n_embd] — main residual stream
+    float *xb;      // [max_batch * n_embd] — scratch: holds the normed x before attention/FFN
+    float *xb2;     // [max_batch * n_embd] — scratch: projection result before residual add
+    BlockQ8_K *q8_buf; // [max_batch * max(n_embd, n_ff) / 256] — quantized activations for SDOT GEMM
 
     // ── attention buffers ──
 
-    float *q;       // [n_heads    * head_dim] — query projection
-    float *k;       // [n_kv_heads * head_dim] — key   projection
-    float *v;       // [n_kv_heads * head_dim] — value projection
-    float *att;     // [n_heads * n_ctx]        — attention scores (one row per head)
+    float *q;       // [max_batch * n_heads    * head_dim] — query projection
+    float *k;       // [max_batch * n_kv_heads * head_dim] — key   projection
+    float *v;       // [max_batch * n_kv_heads * head_dim] — value projection
+    float *att;     // [n_heads * n_ctx]                   — attention scores (one row per head)
 
     // ── FFN buffers ──
     // SwiGLU: output = silu(gate) * up, then projected by down.
     // gate and up are computed simultaneously from the same xb input,
     // so both must exist at once before the element-wise multiply.
 
-    float *hb;      // [n_ff] — gate projection (after silu)
-    float *hb2;     // [n_ff] — up   projection
+    float *hb;      // [max_batch * n_ff] — gate projection (after silu)
+    float *hb2;     // [max_batch * n_ff] — up   projection
 
     // ── output ──
 
@@ -69,6 +71,7 @@ struct InferState {
     int n_ff;
     int n_ctx;
     int n_vocab;
+    int max_batch;
 };
 
 // Allocate all buffers based on model hyperparameters.

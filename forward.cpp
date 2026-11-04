@@ -53,6 +53,43 @@ static void matvec_tensor(float *out, LlamaModel *llama, TensorInfo *info, const
     free(w);
 }
 
+// ── matmul_tensor ──
+// Batched quantized GEMM dispatcher for n_tokens input vectors.
+static void matmul_tensor(float *out, LlamaModel *llama, TensorInfo *info,
+                          const float *x, int n_tokens, int n_out, int n_in, BlockQ8_K *q8_buf = nullptr) {
+    if (n_tokens == 1) {
+        matvec_tensor(out, llama, info, x, n_out, n_in, q8_buf);
+        return;
+    }
+
+    static const bool force_old = (getenv("NANO_OLD_MATVEC") != nullptr);
+    if (!force_old) {
+        const void *raw = get_tensor_data(llama->model, info->name);
+        if (info->type == GGML_TYPE_Q4_K && (n_in % 256 == 0)) {
+            matmul_q4_k(out, raw, x, n_tokens, n_out, n_in, q8_buf);
+            return;
+        } else if (info->type == GGML_TYPE_Q6_K && (n_in % 256 == 0)) {
+            matmul_q6_k(out, raw, x, n_tokens, n_out, n_in, q8_buf);
+            return;
+        }
+    }
+
+    for (int t = 0; t < n_tokens; t++) {
+        matvec_tensor(out + (size_t)t * n_out, llama, info, x + (size_t)t * n_in, n_out, n_in, q8_buf);
+    }
+}
+
+// ── cache_kv ──
+// Copies n_tokens K and V vectors from s->k and s->v into layer's KV cache starting at start_pos.
+static void cache_kv(InferState *s, int layer, int start_pos, int n_tokens) {
+    int kv_dim = s->kv_dim;
+    int n_ctx  = s->n_ctx;
+    float *k_dst = s->k_cache + (size_t)layer * n_ctx * kv_dim + (size_t)start_pos * kv_dim;
+    float *v_dst = s->v_cache + (size_t)layer * n_ctx * kv_dim + (size_t)start_pos * kv_dim;
+    memcpy(k_dst, s->k, (size_t)n_tokens * kv_dim * sizeof(float));
+    memcpy(v_dst, s->v, (size_t)n_tokens * kv_dim * sizeof(float));
+}
+
 // ── mha — Multi-Head Attention with Grouped Query Attention ──
 //
 // Writes current token's K and V to the KV cache, then invokes the fused
@@ -62,18 +99,34 @@ void mha(InferState *s, int layer, int pos) {
     int n_ctx  = s->n_ctx;
 
     // 1. Write current K and V into the cache
-    float *k_pos = s->k_cache + layer * n_ctx * kv_dim + pos * kv_dim;
-    float *v_pos = s->v_cache + layer * n_ctx * kv_dim + pos * kv_dim;
-
-    for (int i = 0; i < kv_dim; i++) k_pos[i] = s->k[i];
-    for (int i = 0; i < kv_dim; i++) v_pos[i] = s->v[i];
+    cache_kv(s, layer, pos, 1);
 
     // 2. Compute multi-head attention (fused ops kernel)
-    const float *k_layer = s->k_cache + layer * n_ctx * kv_dim;
-    const float *v_layer = s->v_cache + layer * n_ctx * kv_dim;
+    const float *k_layer = s->k_cache + (size_t)layer * n_ctx * kv_dim;
+    const float *v_layer = s->v_cache + (size_t)layer * n_ctx * kv_dim;
 
     mha_decode(s->xb, s->q, k_layer, v_layer, s->att, pos,
                s->n_heads, s->n_kv_heads, s->head_dim, s->kv_dim, s->n_ctx);
+}
+
+void mha_batch(InferState *s, int layer, int start_pos, int n_tokens) {
+    int n_embd = s->n_embd;
+    int kv_dim = s->kv_dim;
+    int n_ctx  = s->n_ctx;
+
+    // 1. Write all n_tokens K and V vectors into the KV cache
+    cache_kv(s, layer, start_pos, n_tokens);
+
+    // 2. Causal multi-head attention for each token t at sequence position (start_pos + t)
+    const float *k_layer = s->k_cache + (size_t)layer * n_ctx * kv_dim;
+    const float *v_layer = s->v_cache + (size_t)layer * n_ctx * kv_dim;
+
+    for (int t = 0; t < n_tokens; t++) {
+        mha_decode(s->xb + (size_t)t * n_embd,
+                   s->q  + (size_t)t * n_embd,
+                   k_layer, v_layer, s->att, start_pos + t,
+                   s->n_heads, s->n_kv_heads, s->head_dim, kv_dim, n_ctx);
+    }
 }
 
 // ── forward_layer ──
@@ -253,9 +306,174 @@ void forward_token(LlamaModel *llama, InferState *s, int token, int pos, bool ne
     }
 }
 
+// ── forward_layer_batch ──
+// Evaluates one transformer layer across a batch of `n_tokens` tokens starting at `start_pos`.
+static void forward_layer_batch(LlamaModel *llama, InferState *s, int layer, int start_pos, int n_tokens,
+                                ProbeAccum *pa_norm,
+                                ProbeAccum *pa_qkv,
+                                ProbeAccum *pa_rope,
+                                ProbeAccum *pa_mha,
+                                ProbeAccum *pa_out_proj,
+                                ProbeAccum *pa_ffn) {
+    const LlamaHparams &hp = llama->hparams;
+    const LlamaLayer   &lw = llama->layers[layer];
+    probe_set_layer(layer);
+
+    int n_embd = s->n_embd;
+    int kv_dim = s->kv_dim;
+    int n_ff   = s->n_ff;
+
+    // 1. Pre-attention RMSNorm across batch
+    {
+        auto t0 = pa_norm->start();
+        const float *w = (const float *)get_tensor_data(llama->model, lw.attn_norm->name);
+        for (int t = 0; t < n_tokens; t++) {
+            rmsnorm(s->xb + (size_t)t * n_embd, s->x + (size_t)t * n_embd, w, n_embd, hp.rms_norm_eps);
+        }
+        pa_norm->stop(t0);
+    }
+
+    // 2. Batched Q / K / V projections (4x register-blocked weight reuse)
+    {
+        auto t0 = pa_qkv->start();
+        matmul_tensor(s->q, llama, lw.attn_q, s->xb, n_tokens, n_embd, n_embd, s->q8_buf);
+        matmul_tensor(s->k, llama, lw.attn_k, s->xb, n_tokens, kv_dim, n_embd, s->q8_buf);
+        matmul_tensor(s->v, llama, lw.attn_v, s->xb, n_tokens, kv_dim, n_embd, s->q8_buf);
+        pa_qkv->stop(t0);
+    }
+
+    // 3. RoPE per token at position (start_pos + t)
+    {
+        auto t0 = pa_rope->start();
+        for (int t = 0; t < n_tokens; t++) {
+            rope(s->q + (size_t)t * n_embd,
+                 s->k + (size_t)t * kv_dim,
+                 start_pos + t,
+                 s->n_heads, s->n_kv_heads, s->head_dim,
+                 (int)hp.rope_dim_count, hp.rope_freq_base);
+        }
+        pa_rope->stop(t0);
+    }
+
+    // 4. Batched KV cache update + Causal Multi-Head Attention
+    {
+        auto t0 = pa_mha->start();
+        mha_batch(s, layer, start_pos, n_tokens);
+        pa_mha->stop(t0);
+    }
+
+    // 5. Batched Attention Output Projection + Residual Add
+    {
+        auto t0 = pa_out_proj->start();
+        matmul_tensor(s->xb2, llama, lw.attn_output, s->xb, n_tokens, n_embd, n_embd, s->q8_buf);
+        size_t total_embd = (size_t)n_tokens * n_embd;
+        for (size_t i = 0; i < total_embd; i++) s->x[i] += s->xb2[i];
+        pa_out_proj->stop(t0);
+    }
+
+    // 6..9. Batched FFN Block (SwiGLU)
+    {
+        auto t0 = pa_ffn->start();
+
+        const float *w = (const float *)get_tensor_data(llama->model, lw.ffn_norm->name);
+        for (int t = 0; t < n_tokens; t++) {
+            rmsnorm(s->xb + (size_t)t * n_embd, s->x + (size_t)t * n_embd, w, n_embd, hp.rms_norm_eps);
+        }
+
+        if (lw.ffn_gate->type == GGML_TYPE_Q4_K && lw.ffn_up->type == GGML_TYPE_Q4_K && (n_embd % 256 == 0)) {
+            const void *raw_gate = get_tensor_data(llama->model, lw.ffn_gate->name);
+            const void *raw_up   = get_tensor_data(llama->model, lw.ffn_up->name);
+            matmul_q4_k_gate_up(s->hb, s->hb2, raw_gate, raw_up, s->xb, n_tokens, n_ff, n_embd, s->q8_buf);
+        } else {
+            matmul_tensor(s->hb,  llama, lw.ffn_gate, s->xb, n_tokens, n_ff, n_embd, s->q8_buf);
+            matmul_tensor(s->hb2, llama, lw.ffn_up,   s->xb, n_tokens, n_ff, n_embd, s->q8_buf);
+        }
+
+        size_t total_ff = (size_t)n_tokens * n_ff;
+        silu(s->hb, s->hb, (int)total_ff);
+        for (size_t i = 0; i < total_ff; i++) s->hb[i] *= s->hb2[i];
+
+        matmul_tensor(s->xb2, llama, lw.ffn_down, s->hb, n_tokens, n_embd, n_ff, s->q8_buf);
+        size_t total_embd = (size_t)n_tokens * n_embd;
+        for (size_t i = 0; i < total_embd; i++) s->x[i] += s->xb2[i];
+
+        pa_ffn->stop(t0);
+    }
+}
+
+// ── forward_batch ──
+// Runs a full forward pass for a batch of `n_tokens` tokens starting at `start_pos`.
+void forward_batch(LlamaModel *llama, InferState *s, const int *tokens, int n_tokens, int start_pos, bool need_logits) {
+    if (n_tokens <= 0) return;
+    if (n_tokens == 1) {
+        forward_token(llama, s, tokens[0], start_pos, need_logits);
+        return;
+    }
+    if (start_pos < 0 || start_pos + n_tokens > s->n_ctx) {
+        fprintf(stderr, "ERROR: batch [%d, %d) exceeds context window limit %d\n",
+                start_pos, start_pos + n_tokens, s->n_ctx);
+        exit(1);
+    }
+    if (n_tokens > s->max_batch) {
+        fprintf(stderr, "ERROR: batch size %d exceeds max_batch %d\n", n_tokens, s->max_batch);
+        exit(1);
+    }
+
+    int n_embd = s->n_embd;
+    // Record the last token position of this batch in the probe context
+    probe_set_pos(start_pos + n_tokens - 1);
+
+    // 1. Embedding lookup for all n_tokens
+    {
+        Probe p("embedding_lookup");
+        TensorInfo *embd_info = llama->token_embd;
+        size_t stride = row_bytes(embd_info->type, n_embd);
+        if (stride == 0) {
+            fprintf(stderr, "ERROR: unsupported token_embd type %u\n", (unsigned)embd_info->type);
+            exit(1);
+        }
+        const uint8_t *base = (const uint8_t *)get_tensor_data(llama->model, embd_info->name);
+        for (int t = 0; t < n_tokens; t++) {
+            int tok = tokens[t];
+            if (tok < 0 || tok >= s->n_vocab) {
+                fprintf(stderr, "ERROR: token ID %d out of vocabulary bounds [0, %d)\n", tok, s->n_vocab);
+                exit(1);
+            }
+            dequantize(base + (size_t)tok * stride, s->x + (size_t)t * n_embd, n_embd, embd_info->type);
+        }
+    }
+
+    // 2. Transformer layers across the batch
+    {
+        ProbeAccum pa_norm    ("layer:attn_norm");
+        ProbeAccum pa_qkv     ("layer:qkv_proj");
+        ProbeAccum pa_rope    ("layer:rope");
+        ProbeAccum pa_mha     ("layer:mha");
+        ProbeAccum pa_out_proj("layer:attn_out_proj");
+        ProbeAccum pa_ffn     ("layer:ffn");
+
+        Probe p_layers("all_layers");
+        for (int layer = 0; layer < s->n_layers; layer++) {
+            forward_layer_batch(llama, s, layer, start_pos, n_tokens,
+                                &pa_norm, &pa_qkv, &pa_rope,
+                                &pa_mha, &pa_out_proj, &pa_ffn);
+        }
+        probe_set_layer(-1);
+    }
+
+    // 3. Final RMSNorm + Output Projection on the last token of the batch
+    if (need_logits) {
+        Probe p("final_norm_and_lm_head");
+        float *x_last = s->x + (size_t)(n_tokens - 1) * n_embd;
+        float *w = (float *)get_tensor_data(llama->model, llama->output_norm->name);
+        rmsnorm(x_last, x_last, w, n_embd, llama->hparams.rms_norm_eps);
+        matvec_tensor(s->logits, llama, llama->output, x_last, s->n_vocab, n_embd, s->q8_buf);
+    }
+}
+
 // ── prefill ──
-// Feeds a sequence of prompt tokens into the model.
-// Evaluates each token, storing keys and values in the KV cache.
+// Feeds a sequence of prompt tokens into the model in batches of up to max_batch.
+// Evaluates each batch, storing keys and values in the KV cache.
 // Only computes final output logits on the last token.
 void prefill(LlamaModel *llama, InferState *s, const int *tokens, int n_tokens) {
     if (n_tokens > s->n_ctx) {
@@ -263,13 +481,20 @@ void prefill(LlamaModel *llama, InferState *s, const int *tokens, int n_tokens) 
         exit(1);
     }
 
+    int batch_size = 16;
+    if (const char *env_b = getenv("NANO_BATCH")) {
+        int b = atoi(env_b);
+        if (b >= 1 && b <= s->max_batch) batch_size = b;
+    }
+
     probe_set_pos(-1);
     Probe p_prefill("prefill_total");
     ProbeAccum pa_forward("prefill:forward_token");
-    for (int pos = 0; pos < n_tokens; pos++) {
-        bool need_logits = (pos == n_tokens - 1);
+    for (int pos = 0; pos < n_tokens; pos += batch_size) {
+        int chunk = (pos + batch_size <= n_tokens) ? batch_size : (n_tokens - pos);
+        bool need_logits = (pos + chunk == n_tokens);
         auto t = pa_forward.start();
-        forward_token(llama, s, tokens[pos], pos, need_logits);
+        forward_batch(llama, s, tokens + pos, chunk, pos, need_logits);
         pa_forward.stop(t);
     }
     probe_set_pos(-1);

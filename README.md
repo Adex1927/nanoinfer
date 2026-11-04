@@ -78,50 +78,71 @@ first 10 dequantized weights: -0.012451 0.003906 -0.021484 ...
 
 ## Performance & Benchmarks
 
-Measured on Apple Silicon (Apple M3, ARM NEON SDOT `vdotq_s32`, dynamic work-stealing thread pool, 6 threads) running **TinyLlama 1.1B (`Q4_K_M`)** across the full **2,048 context window** (66 prefill tokens, 1,982 decode tokens generated):
+Measured on Apple Silicon (Apple M3, ARM NEON SDOT `vdotq_s32`, dynamic work-stealing thread pool, 6 threads) running **TinyLlama 1.1B (`Q4_K_M`)** across the full **2,048 context window** (649 prefill tokens in batches of $B=16$, followed by 1,399 decode tokens generated):
 
-- **Average Decode Latency:** **~18.9 ms/token** (**~52.8 tokens/sec**) average across the entire context window (down from **1041 ms/token** naive baseline — **~55× speedup**).
-- **Graceful Context Scaling:** Latency stays flat and responsive, scaling from **14.4 ms/token** (69.4 tok/s) at position 100 to **21.8 ms/token** (45.8 tok/s) at position 1,980.
-- **Fused Multithreaded NEON Attention:** Multi-head attention (MHA) across all 22 layers takes only **6.54 ms** total at position 1,980 (down from **34.4 ms** unvectorized single-threaded baseline — **~5.3× speedup**).
-- **DRAM Traffic per Token:** **0 GB** (fused in-register quantized GEMV).
+- **Batched Prefill Throughput:** **~6.0 ms/token** median (**~165.9 tokens/sec**, `4,312 ms` total for 649 prompt tokens) using 4-token register-blocked NEON GEMM (`matmul_q4_k` / `matmul_q6_k`), achieving up to **~458 GFLOP/s** and a **~2.5× speedup** over sequential single-token prefill.
+- **Average Decode Latency:** **~17.3 ms/token** median (**~57.7 tokens/sec**, down from **18.9 ms/tok** before in-register NEON scale accumulation and **1041 ms/tok** naive baseline — **~60× speedup**).
+- **Graceful Context Scaling:** Decode latency scales smoothly from **15.10 ms/token** (66.2 tok/s) at position 650 to **20.42 ms/token** (49.0 tok/s) at position 1,980.
+- **Fused Multithreaded NEON Attention:** Multi-head attention (MHA) across all 22 layers takes only **6.58 ms** total at position 1,980 (down from **34.4 ms** unvectorized single-threaded baseline — **~5.2× speedup**).
+- **DRAM Allocation per Token:** **0 bytes** (fused in-register quantized GEMV / GEMM).
 
-### Profiling Analysis (1,982 Decode Tokens across 2,048 Context)
+### Profiling Analysis (649 Prefill Tokens + 1,399 Decode Tokens across 2,048 Context)
 
 ![Performance Profile across 2048 Context Length](probe.png)
 
-### Breakdown by Component (averaged over 1,982 decode tokens from `probe.csv`)
+### Per-Token Stage Breakdown: Prefill ($B=16$, 649 tokens) vs. Decode ($B=1$, 1,399 tokens)
+
+| Stage (summed over 22 layers) | Prefill (`ms/tok`) | Prefill Share | Decode (`ms/tok`) | Decode Share | Prefill Speedup |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| `layer:ffn` (SwiGLU `Q4_K` / `Q6_K`) | **4.06 ms** | 61.0% | **8.30 ms** | 47.8% | **2.04×** |
+| `layer:mha` (Causal NEON GQA) | **0.97 ms** | 14.6% | **4.45 ms** | 25.6% | *4.59× (shorter avg pos)* |
+| `layer:qkv_proj` (`Q4_K` / `Q6_K`) | **0.78 ms** | 11.8% | **2.29 ms** | 13.2% | **2.94×** |
+| `layer:attn_out_proj` (`Q4_K`) | **0.51 ms** | 7.6% | **1.26 ms** | 7.3% | **2.47×** |
+| `final_norm_and_lm_head` (`Q6_K`) | **0.003 ms** | 0.1% | **0.80 ms** | 4.6% | *Evaluated once on last tok* |
+| `layer:rope` | **0.18 ms** | 2.7% | **0.21 ms** | 1.2% | 1.17× |
+| `layer:attn_norm` | **0.04 ms** | 0.6% | **0.06 ms** | 0.3% | 1.50× |
+| `embedding_lookup` | **0.11 ms** | 1.7% | **0.004 ms** | 0.0% | — |
+| **Total (Median Step)** | **6.02 ms/tok** | **165.9 tok/s** | **17.32 ms/tok** | **57.7 tok/s** | **2.88×** |
+
+### Raw Probe Summary (from `probe.csv`)
 
 | Component / Stage | Phase | Samples | Mean | p50 | p99 | Notes |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| `decode:forward_token` | `decode` | 1,982 | **18.94 ms** | **18.94 ms** | 24.61 ms | Full per-token decode step (~52.8 tok/s avg) |
-| `all_layers` | `decode` | 1,982 | **18.04 ms** | **18.00 ms** | 23.62 ms | 22 transformer layers combined |
-| ├── `layer:ffn` | `decode` | 43,604 | **0.45 ms** | **0.43 ms** | 0.63 ms | SwiGLU FFN (`Q4_K` / `Q6_K` SDOT kernels) |
-| ├── `layer:mha` | `decode` | 43,604 | **0.17 ms** | **0.16 ms** | 0.33 ms | Fused NEON multi-head attention across 32 heads |
-| ├── `layer:qkv_proj` | `decode` | 43,604 | **0.12 ms** | **0.12 ms** | 0.17 ms | Q, K, V projections |
-| ├── `layer:attn_out_proj` | `decode` | 43,604 | **0.07 ms** | **0.07 ms** | 0.11 ms | Attention output projection |
-| ├── `layer:rope` | `decode` | 43,604 | **0.009 ms** | **0.009 ms** | 0.011 ms | Rotary Position Embeddings |
-| └── `layer:attn_norm` | `decode` | 43,604 | **0.003 ms** | **0.002 ms** | 0.004 ms | RMSNorm |
-| `final_norm_and_lm_head`| `decode` | 1,982 | **0.85 ms** | **0.83 ms** | 1.16 ms | RMSNorm + Vocab projection (`Q6_K` SDOT) |
-| `embedding_lookup` | `decode` | 1,982 | **0.05 ms** | **0.001 ms** | 0.86 ms | Single-row dequantization |
-| `decode:argmax` | `decode` | 1,983 | **0.02 ms** | **0.02 ms** | 0.08 ms | Greedy token sampling |
+| `prefill_total` | `prefill` | 1 | **4312.40 ms** | **4312.40 ms** | 4312.40 ms | Full 649-token prompt prefill (`6.02 ms/tok` med) |
+| `prefill:forward_token` | `prefill` | 41 | **105.18 ms** | **96.35 ms** | 106.37 ms | Per 16-token prefill batch (~165.9 tok/s med) |
+| `decode:forward_token` | `decode` | 1,399 | **17.38 ms** | **17.32 ms** | 21.79 ms | Full per-token decode step (~57.7 tok/s med) |
+| `all_layers` | `decode` | 1,399 | **16.57 ms** | **16.52 ms** | 20.89 ms | 22 transformer layers combined |
+| ├── `layer:ffn` | `decode` | 30,778 | **0.377 ms** | **0.367 ms** | 0.556 ms | SwiGLU FFN (`Q4_K` / `Q6_K` SDOT kernels) |
+| ├── `layer:mha` | `decode` | 30,778 | **0.202 ms** | **0.199 ms** | 0.324 ms | Fused NEON multi-head attention across 32 heads |
+| ├── `layer:qkv_proj` | `decode` | 30,778 | **0.104 ms** | **0.101 ms** | 0.155 ms | Q, K, V projections |
+| ├── `layer:attn_out_proj` | `decode` | 30,778 | **0.057 ms** | **0.055 ms** | 0.095 ms | Attention output projection |
+| ├── `layer:rope` | `decode` | 30,778 | **0.009 ms** | **0.009 ms** | 0.011 ms | Rotary Position Embeddings |
+| └── `layer:attn_norm` | `decode` | 30,778 | **0.003 ms** | **0.003 ms** | 0.003 ms | RMSNorm |
+| `final_norm_and_lm_head`| `decode` | 1,399 | **0.803 ms** | **0.789 ms** | 1.069 ms | RMSNorm + Vocab projection (`Q6_K` SDOT) |
+| `embedding_lookup` | `decode` | 1,399 | **0.004 ms** | **0.001 ms** | 0.002 ms | Single-row dequantization |
+| `decode:argmax` | `decode` | 1,400 | **0.021 ms** | **0.020 ms** | 0.066 ms | Greedy token sampling |
 
 ### Latency Scaling with Context Length
 
-| Token Position | Decode Latency | Throughput | 22-Layer MHA Total |
-| :--- | :--- | :--- | :--- |
-| `pos = 100` | **14.42 ms** | **69.4 tok/s** | 0.60 ms (0.027 ms/layer) |
-| `pos = 500` | **15.55 ms** | **64.3 tok/s** | 1.84 ms (0.083 ms/layer) |
-| `pos = 1000` | **18.20 ms** | **55.0 tok/s** | 3.31 ms (0.150 ms/layer) |
-| `pos = 1500` | **20.68 ms** | **48.4 tok/s** | 5.07 ms (0.231 ms/layer) |
-| `pos = 1980` | **21.83 ms** | **45.8 tok/s** | 6.54 ms (0.297 ms/layer) |
+| Token Position | Phase | Latency per Token | Throughput | 22-Layer MHA Total |
+| :--- | :--- | :--- | :--- | :--- |
+| `pos = 111` | `prefill` ($B=16$) | **5.69 ms/tok** | **175.8 tok/s** | 0.64 ms/tok (0.029 ms/layer) |
+| `pos = 511` | `prefill` ($B=16$) | **6.28 ms/tok** | **159.3 tok/s** | 1.27 ms/tok (0.058 ms/layer) |
+| `pos = 650` | `decode` ($B=1$) | **15.10 ms/tok** | **66.2 tok/s** | 2.16 ms/tok (0.098 ms/layer) |
+| `pos = 1000` | `decode` ($B=1$) | **15.37 ms/tok** | **65.1 tok/s** | 3.18 ms/tok (0.145 ms/layer) |
+| `pos = 1500` | `decode` ($B=1$) | **17.47 ms/tok** | **57.3 tok/s** | 4.81 ms/tok (0.219 ms/layer) |
+| `pos = 1980` | `decode` ($B=1$) | **20.42 ms/tok** | **49.0 tok/s** | 6.58 ms/tok (0.299 ms/layer) |
 
 To reproduce these metrics and generate the plots on your machine:
 ```bash
-# Run 2,000 token generation with long-context story prompt
-NANO_IGNORE_EOS=1 NANO_PROMPT_FILE=prompt_long.txt NANO_N=2000 ./model_test ../llama.cpp/models/tinyllama.gguf
+# Run full 2,048-context generation with the 649-token prompt
+NANO_IGNORE_EOS=1 NANO_PROMPT_FILE=prompts/prompt_500.txt NANO_N=2000 ./model_test ../llama.cpp/models/tinyllama.gguf
 
-# Plot the probe results
-python3 tools/plot_probe.py probe.csv -o probe.png
+# Plot both prefill and decode probe results side-by-side
+python3 tools/plot_probe.py probe.csv --phase both -o probe.png
+
+# Benchmark batched prefill across B in {1, 2, 4, 8, 16, 32, 64}
+python3 tools/bench_prefill.py -m ../llama.cpp/models/tinyllama.gguf
 ```
 
 ---
@@ -135,10 +156,13 @@ python3 tools/plot_probe.py probe.csv -o probe.png
 - [x] End-to-end autoregressive text generation
 - [x] Single-row embedding lookup optimization (20.5 ms -> 0.09 ms)
 - [x] ARM NEON SDOT (`vdotq_s32`) fused quantized GEMV for `Q4_K` and `Q6_K`
-- [x] Fused `gate` + `up` GEMVs (saving 22 thread sync barriers per token)
+- [x] In-register NEON scale accumulation (1 horizontal `vaddvq_s32` reduction per 256-weight super-block)
+- [x] Fused `gate` + `up` projections (saving 22 thread sync barriers per step)
 - [x] Dynamic atomic work-stealing thread pool with QoS across heterogeneous cores
 - [x] Fused multithreaded NEON Multi-Head Attention kernel (`mha_decode`)
-- [ ] Multi-row register blocking (2-row SDOT)
+- [x] 4-token activation register-blocked NEON GEMM (`matmul_q4_k`, `matmul_q6_k`) and batched `forward_batch` prefill
+- [ ] Speculative decoding (N-Gram / Prompt-Lookup drafting with $B=4$ parallel verification)
+- [ ] `Q8_0` quantized KV cache
 - [ ] Pipeline parallelism over TCP sockets
 
 ---

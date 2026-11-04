@@ -130,7 +130,7 @@ int main() {
     // 3. FFN Down Projection: 2048 x 5632
     benchmark_layer("FFN Down (ffn_down)", 2048, 5632);
 
-    // 4. Batched GEMM (matmul_q4_k & matmul_q6_k) scaling across B in {1, 2, 4, 8, 16}
+    // 4. Batched GEMM (matmul_q4_k & matmul_q6_k) scaling across B in {1, 2, 4, 8, 16, 32, 64}
     {
         const int n_out = 5632, n_in = 2048, iters = 30;
         const int n_blocks = (n_out * n_in) / 256;
@@ -141,10 +141,10 @@ int main() {
             W6[b].d = 0x3800;
         }
         printf("=== Batched GEMM Throughput (5632 x 2048) ===\n");
-        const int batch_sizes[] = {1, 2, 4, 8, 16};
+        const int batch_sizes[] = {1, 2, 4, 8, 16, 32, 64};
         for (int B : batch_sizes) {
-            std::vector<float> X(B * n_in, 1.0f);
-            std::vector<float> Y(B * n_out);
+            std::vector<float> X((size_t)B * n_in, 1.0f);
+            std::vector<float> Y((size_t)B * n_out);
             matmul_q4_k(Y.data(), W4.data(), X.data(), B, n_out, n_in);
             auto t0 = std::chrono::high_resolution_clock::now();
             for (int i = 0; i < iters; i++) {
