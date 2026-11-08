@@ -73,16 +73,20 @@ namespace probe_detail {
 
 struct Record {
     int         name_id;
-    const char *phase;      // string literal ("" if unset)
-    int         token_pos;  // -1 = n/a
-    int         layer;      // -1 = n/a
+    const char *phase;          // string literal ("" if unset)
+    int         token_pos;      // -1 = n/a
+    int         layer;          // -1 = n/a
+    int         batch_tokens;   // B: hardware tokens evaluated in this step/chunk
+    int         emitted_tokens; // E: meaningful/accepted tokens emitted in this step/chunk
     double      ms;
 };
 
 struct Context {
-    const char *phase = "";
-    int         pos   = -1;
-    int         layer = -1;
+    const char *phase          = "";
+    int         pos            = -1;
+    int         layer          = -1;
+    int         batch_tokens   = 1;
+    int         emitted_tokens = 1;
 };
 
 struct Store {
@@ -108,7 +112,7 @@ inline int intern(const char *name) {
 }
 
 inline void push(int name_id, const Context &c, double ms) {
-    store().records.push_back({name_id, c.phase, c.pos, c.layer, ms});
+    store().records.push_back({name_id, c.phase, c.pos, c.layer, c.batch_tokens, c.emitted_tokens, ms});
 }
 
 } // namespace probe_detail
@@ -117,17 +121,32 @@ inline void push(int name_id, const Context &c, double ms) {
 inline void probe_set_phase(const char *phase) { probe_detail::store().ctx.phase = phase; }
 inline void probe_set_pos(int pos)             { probe_detail::store().ctx.pos   = pos;   }
 inline void probe_set_layer(int layer)         { probe_detail::store().ctx.layer = layer; }
+inline void probe_set_batch_tokens(int b) {
+    probe_detail::store().ctx.batch_tokens   = b;
+    probe_detail::store().ctx.emitted_tokens = b;
+}
+inline size_t probe_record_count() {
+    return probe_detail::store().records.size();
+}
+inline void probe_set_step_emitted(size_t from_record_idx, int emitted) {
+    auto &recs = probe_detail::store().records;
+    for (size_t i = from_record_idx; i < recs.size(); i++) {
+        recs[i].emitted_tokens = emitted;
+    }
+    probe_detail::store().ctx.emitted_tokens = emitted;
+}
 
 // ── probe_dump_csv ──
-// Writes every raw sample: name,phase,token_pos,layer,ms
+// Writes every raw sample: name,phase,token_pos,layer,batch_tokens,emitted_tokens,ms
 inline bool probe_dump_csv(const char *path) {
     FILE *f = fopen(path, "w");
     if (!f) { perror("probe_dump_csv"); return false; }
     const auto &s = probe_detail::store();
-    fprintf(f, "name,phase,token_pos,layer,ms\n");
+    fprintf(f, "name,phase,token_pos,layer,batch_tokens,emitted_tokens,ms\n");
     for (const auto &r : s.records) {
-        fprintf(f, "%s,%s,%d,%d,%.6f\n",
-                s.names[r.name_id].c_str(), r.phase, r.token_pos, r.layer, r.ms);
+        fprintf(f, "%s,%s,%d,%d,%d,%d,%.6f\n",
+                s.names[r.name_id].c_str(), r.phase, r.token_pos, r.layer,
+                r.batch_tokens, r.emitted_tokens, r.ms);
     }
     fclose(f);
     fprintf(stderr, "[PROBE] wrote %zu samples to %s\n", s.records.size(), path);
@@ -202,11 +221,14 @@ struct ProbeAccum {
 
 #else // PROBE_ENABLED == 0
 
-inline void probe_set_phase(const char *) {}
-inline void probe_set_pos(int)            {}
-inline void probe_set_layer(int)          {}
-inline bool probe_dump_csv(const char *)  { return true; }
-inline void probe_print_summary()         {}
+inline void   probe_set_phase(const char *)             {}
+inline void   probe_set_pos(int)                        {}
+inline void   probe_set_layer(int)                      {}
+inline void   probe_set_batch_tokens(int)               {}
+inline size_t probe_record_count()                      { return 0; }
+inline void   probe_set_step_emitted(size_t, int)       {}
+inline bool   probe_dump_csv(const char *)              { return true; }
+inline void   probe_print_summary()                     {}
 
 struct Probe {
     explicit Probe(const char *) {}

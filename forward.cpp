@@ -254,6 +254,7 @@ void forward_token(LlamaModel *llama, InferState *s, int token, int pos, bool ne
 
     int n_embd = s->n_embd;
     probe_set_pos(pos);
+    probe_set_batch_tokens(1);
 
     // 1. Embedding lookup: dequantize only row `token` straight into s->x
     {
@@ -423,10 +424,11 @@ void forward_batch(LlamaModel *llama, InferState *s, const int *tokens, int n_to
     }
 
     int n_embd = s->n_embd;
-    // Record the token position of this batch in the probe context:
+    // Record the token position and batch size of this batch in the probe context:
     // - prefill (!all_logits): record last token of chunk (start_pos + n_tokens - 1)
     // - speculative decode (all_logits): record start_pos (strictly monotonic with accepted pos)
     probe_set_pos(all_logits ? start_pos : (start_pos + n_tokens - 1));
+    probe_set_batch_tokens(n_tokens);
 
     // 1. Embedding lookup for all n_tokens
     {
@@ -510,6 +512,7 @@ void prefill(LlamaModel *llama, InferState *s, const int *tokens, int n_tokens) 
         pa_forward.stop(t);
     }
     probe_set_pos(-1);
+    probe_set_batch_tokens(1);
     // p_prefill destructor fires here → prints total prefill wall time
 }
 
@@ -619,6 +622,7 @@ int generate(LlamaModel *llama, InferState *s,
         n_steps++;
         n_drafted += k;
 
+        size_t step_rec0 = probe_record_count();
         {
             auto t = pa_forward.start();
             forward_batch(llama, s, batch, B, pos, true, /*all_logits=*/true);
@@ -626,6 +630,7 @@ int generate(LlamaModel *llama, InferState *s,
         }
 
         // Verify drafted tokens against greedy target argmax at each position t = 0..k
+        int step_emitted = 0;
         for (int t = 0; t <= k; t++) {
             probe_set_pos(pos + t);
             int next;
@@ -645,6 +650,7 @@ int generate(LlamaModel *llama, InferState *s,
 
             if (on_token) on_token(next, user);
             n_generated++;
+            step_emitted++;
             history.push_back(next);
             cur_tok = next;
 
@@ -659,6 +665,7 @@ int generate(LlamaModel *llama, InferState *s,
                 break;
             }
         }
+        probe_set_step_emitted(step_rec0, step_emitted > 0 ? step_emitted : 1);
     }
 
     if (n_steps > 0) {

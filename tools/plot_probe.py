@@ -34,6 +34,19 @@ LAYER_STAGES = [
 TOKEN_STAGES = ["embedding_lookup", "final_norm_and_lm_head"]
 
 
+def step_token_counts(sub, index, phase, col="emitted_tokens"):
+    """Return per-step token counts aligned to `index` (token_pos)."""
+    if len(index) == 0:
+        return np.array([], dtype=float)
+    if col in sub.columns:
+        fwd = sub[sub.name == f"{phase}:forward_token"]
+        src = fwd if not fwd.empty else sub[sub.token_pos >= 0]
+        s = src.groupby("token_pos")[col].first().reindex(index)
+        vals = s.fillna(1.0).values.astype(float)
+        return np.maximum(vals, 1.0)
+    return chunk_sizes(index, phase)
+
+
 def print_table(df):
     g = df.groupby(["name", "phase"]).ms
     t = g.agg(n="count", total="sum", mean="mean",
@@ -41,42 +54,87 @@ def print_table(df):
     t = t.round(3)
     print(t.to_string())
 
+    if "batch_tokens" in df.columns and "emitted_tokens" in df.columns:
+        print("\n=== Work Done (batch_tokens) vs Meaningful Work (emitted_tokens) ===")
+        for phase in ["prefill", "decode"]:
+            step_df = df[(df.phase == phase) & (df.name == f"{phase}:forward_token")]
+            if step_df.empty:
+                continue
+            steps = len(step_df)
+            hw_toks = int(step_df.batch_tokens.sum())
+            em_toks = int(step_df.emitted_tokens.sum())
+            tot_ms = step_df.ms.sum()
+            useful_pct = (100.0 * em_toks / hw_toks) if hw_toks > 0 else 0.0
+            eff_ms = tot_ms / em_toks if em_toks > 0 else 0.0
+            hw_ms = tot_ms / hw_toks if hw_toks > 0 else 0.0
+            print(f"  {phase:7s}: steps={steps:4d} | hw_tokens={hw_toks:4d} ({hw_ms:6.2f} ms/hw_tok) | "
+                  f"emitted_tokens={em_toks:4d} ({useful_pct:5.1f}% useful) | "
+                  f"effective={eff_ms:6.2f} ms/tok ({1000.0/eff_ms if eff_ms > 0 else 0.0:6.1f} tok/s)")
+
 
 def chunk_sizes(index, phase):
-    """Return number of tokens processed at each recorded token_pos."""
+    """Fallback when CSV does not contain batch_tokens / emitted_tokens columns."""
     if len(index) == 0:
         return np.array([], dtype=float)
     if phase == "prefill":
         sizes = np.diff(index, prepend=-1).astype(float)
         return np.maximum(sizes, 1.0)
+    if len(index) > 1:
+        sizes = np.diff(index, append=index[-1] + 1).astype(float)
+        return np.maximum(sizes, 1.0)
     return np.ones(len(index), dtype=float)
 
 
 def per_token_breakdown(sub, phase="decode"):
-    """ms per token, per stage (layer stages summed over layers, normalized by batch chunk size)."""
+    """ms per emitted token, per stage (layer stages summed over layers, normalized by step emitted_tokens)."""
     parts = {}
     for st in LAYER_STAGES + TOKEN_STAGES:
         d = sub[sub.name == st]
         parts[st] = d.groupby("token_pos").ms.sum()
     bd = pd.DataFrame(parts).fillna(0.0).sort_index()
     if not bd.empty:
-        sizes = chunk_sizes(bd.index.values, phase)
+        sizes = step_token_counts(sub, bd.index.values, phase, "emitted_tokens")
         bd = bd.div(sizes, axis=0)
     return bd
 
 
+def stage_effective_means(sub, bd, phase="decode"):
+    """True weighted mean ms per emitted token for each stage: sum(stage_ms) / sum(emitted_tokens)."""
+    if bd.empty:
+        return pd.Series(dtype=float)
+    sizes = step_token_counts(sub, bd.index.values, phase, "emitted_tokens")
+    total_emitted = sizes.sum()
+    if total_emitted <= 0:
+        return bd.mean()
+    raw_sums = {}
+    for st in bd.columns:
+        raw_sums[st] = sub[sub.name == st].ms.sum() / total_emitted
+    return pd.Series(raw_sums)
+
+
 def step_series(sub, bd, phase):
-    """Return a Series of per-token step latency indexed by token_pos."""
+    """Return a Series of per-emitted-token step latency indexed by token_pos."""
     probe_name = f"{phase}:forward_token"
     step = sub[sub.name == probe_name].sort_values("token_pos")
     if not step.empty:
         s = step.set_index("token_pos").ms.sort_index()
-        sizes = chunk_sizes(s.index.values, phase)
+        sizes = step_token_counts(sub, s.index.values, phase, "emitted_tokens")
         return s / sizes
     # Fallback for older CSVs without prefill:forward_token
     if not bd.empty:
         return bd.sum(axis=1).sort_index()
     return pd.Series(dtype=float)
+
+
+def overall_effective_ms(sub, s, phase):
+    """Return true overall (total_ms / total_emitted_tokens) for a phase."""
+    probe_name = f"{phase}:forward_token"
+    step = sub[sub.name == probe_name]
+    if not step.empty and "emitted_tokens" in step.columns:
+        em = step.emitted_tokens.sum()
+        if em > 0:
+            return step.ms.sum() / em
+    return s.median() if not s.empty else 0.0
 
 
 def plot_single_phase(ax, sub, phase):
@@ -87,19 +145,19 @@ def plot_single_phase(ax, sub, phase):
     # 1. step latency vs token position
     if not s.empty:
         ax[0].plot(s.index, s.values, marker=".", lw=1)
-        med = s.median()
-        tok_s = 1000.0 / med if med > 0 else 0.0
-        ax[0].axhline(med, color="gray", ls="--", lw=1,
-                      label=f"median {med:.1f} ms ({tok_s:.1f} tok/s)")
+        eff = overall_effective_ms(sub, s, phase)
+        tok_s = 1000.0 / eff if eff > 0 else 0.0
+        ax[0].axhline(eff, color="gray", ls="--", lw=1,
+                      label=f"effective {eff:.1f} ms/tok ({tok_s:.1f} tok/s)")
         ax[0].legend()
     ax[0].set_title(f"{label_cap} step latency")
     ax[0].set_xlabel("token position")
-    ax[0].set_ylabel("ms")
+    ax[0].set_ylabel("ms per emitted token")
     ax[0].set_ylim(bottom=0)
 
     # 2. share of a step by stage
     if not bd.empty and bd.values.sum() > 0:
-        mean_ms = bd.mean().sort_values()
+        mean_ms = stage_effective_means(sub, bd, phase).sort_values()
         share = 100 * mean_ms / mean_ms.sum()
         ax[1].barh(mean_ms.index, mean_ms.values)
         for i, (ms, pct) in enumerate(zip(mean_ms.values, share.values)):
@@ -148,27 +206,29 @@ def plot_both_phases(ax, df):
 
     # 1. Step latency across whole trajectory (prefill + decode)
     if not s_pre.empty:
-        med = s_pre.median()
+        eff = overall_effective_ms(pre, s_pre, "prefill")
         ax[0].plot(s_pre.index, s_pre.values, marker=".", lw=1,
-                   label=f"prefill (med {med:.1f} ms, {1000.0/med:.1f} tok/s)")
+                   label=f"prefill (eff {eff:.1f} ms/tok, {1000.0/eff:.1f} tok/s)")
     if not s_dec.empty:
-        med = s_dec.median()
+        eff = overall_effective_ms(dec, s_dec, "decode")
         ax[0].plot(s_dec.index, s_dec.values, marker=".", lw=1,
-                   label=f"decode (med {med:.1f} ms, {1000.0/med:.1f} tok/s)")
+                   label=f"decode (eff {eff:.1f} ms/tok, {1000.0/eff:.1f} tok/s)")
     if not s_pre.empty or not s_dec.empty:
         ax[0].legend(fontsize=8)
     ax[0].set_title("Prefill vs Decode step latency")
     ax[0].set_xlabel("token position")
-    ax[0].set_ylabel("ms per token")
+    ax[0].set_ylabel("ms per emitted token")
     ax[0].set_ylim(bottom=0)
 
     # 2. Side-by-side grouped horizontal bar chart: mean ms/token by stage
-    stages = ( bd_dec.mean().sort_values().index if not bd_dec.empty
-               else bd_pre.mean().sort_values().index )
+    pre_means = stage_effective_means(pre, bd_pre, "prefill")
+    dec_means = stage_effective_means(dec, bd_dec, "decode")
+    stages = ( dec_means.sort_values().index if not dec_means.empty
+               else pre_means.sort_values().index )
     y_pos = np.arange(len(stages))
     height = 0.40
-    pre_vals = bd_pre.mean().reindex(stages, fill_value=0.0).values if not bd_pre.empty else np.zeros(len(stages))
-    dec_vals = bd_dec.mean().reindex(stages, fill_value=0.0).values if not bd_dec.empty else np.zeros(len(stages))
+    pre_vals = pre_means.reindex(stages, fill_value=0.0).values if not pre_means.empty else np.zeros(len(stages))
+    dec_vals = dec_means.reindex(stages, fill_value=0.0).values if not dec_means.empty else np.zeros(len(stages))
     pre_sum = pre_vals.sum() if pre_vals.sum() > 0 else 1.0
     dec_sum = dec_vals.sum() if dec_vals.sum() > 0 else 1.0
     ax[1].barh(y_pos + height / 2, pre_vals, height, label="prefill")
