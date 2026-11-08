@@ -47,7 +47,7 @@ struct InferState {
 
     // ── output ──
 
-    float *logits;  // [n_vocab] — raw scores over vocabulary (last layer output)
+    float *logits;  // [max_batch * n_vocab] — raw scores over vocabulary (row 0 or per-token batch rows)
 
     // ── KV cache ──
     // Stores the key and value projections for every layer and every past position.

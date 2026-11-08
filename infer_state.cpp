@@ -48,7 +48,7 @@ InferState *alloc_infer_state(const LlamaHparams *hp) {
 
     // ── output logits ──
 
-    s->logits = (float *)calloc(s->n_vocab, sizeof(float));
+    s->logits = (float *)calloc(B * s->n_vocab, sizeof(float));
 
     // ── KV cache ──
     // This is by far the largest allocation.

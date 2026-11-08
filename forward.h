@@ -51,12 +51,15 @@ void mha_batch(InferState *s, int layer, int start_pos, int n_tokens);
 // contiguous tokens starting at sequence position `start_pos` (forward_batch):
 //   1. Embedding lookup: token ids -> s->x
 //   2. Run through all N transformer layers (updates KV cache at start_pos..start_pos+n_tokens-1)
-//   3. If need_logits is true: Final RMSNorm + output projection on the last token -> s->logits
+//   3. If need_logits is true:
+//        - all_logits == false (default): Final RMSNorm + LM head on the last token -> s->logits[0..n_vocab-1]
+//        - all_logits == true:            Final RMSNorm + batched LM head across all n_tokens -> s->logits[t * n_vocab]
 //
 // If need_logits is false (e.g. during prompt prefill before the final chunk),
 // step 3 is skipped to avoid evaluating the output weight matrix.
 void forward_token(LlamaModel *llama, InferState *s, int token, int pos, bool need_logits);
-void forward_batch(LlamaModel *llama, InferState *s, const int *tokens, int n_tokens, int start_pos, bool need_logits);
+void forward_batch(LlamaModel *llama, InferState *s, const int *tokens, int n_tokens, int start_pos,
+                   bool need_logits, bool all_logits = false);
 
 // ── prefill ──
 // Feeds a sequence of prompt tokens into the model to populate the KV cache.
@@ -65,8 +68,8 @@ void forward_batch(LlamaModel *llama, InferState *s, const int *tokens, int n_to
 void prefill(LlamaModel *llama, InferState *s, const int *tokens, int n_tokens);
 
 // ── argmax_token ──
-// Returns the index of the highest value in s->logits (greedy sampling).
-int argmax_token(const InferState *s);
+// Returns the index of the highest value in s->logits + token_idx * n_vocab (greedy sampling).
+int argmax_token(const InferState *s, int token_idx = 0);
 
 // ── generate ──
 // Greedy autoregressive generation:

@@ -403,7 +403,8 @@ static void forward_layer_batch(LlamaModel *llama, InferState *s, int layer, int
 
 // ── forward_batch ──
 // Runs a full forward pass for a batch of `n_tokens` tokens starting at `start_pos`.
-void forward_batch(LlamaModel *llama, InferState *s, const int *tokens, int n_tokens, int start_pos, bool need_logits) {
+void forward_batch(LlamaModel *llama, InferState *s, const int *tokens, int n_tokens, int start_pos,
+                   bool need_logits, bool all_logits) {
     if (n_tokens <= 0) return;
     if (n_tokens == 1) {
         forward_token(llama, s, tokens[0], start_pos, need_logits);
@@ -461,13 +462,20 @@ void forward_batch(LlamaModel *llama, InferState *s, const int *tokens, int n_to
         probe_set_layer(-1);
     }
 
-    // 3. Final RMSNorm + Output Projection on the last token of the batch
+    // 3. Final RMSNorm + Output Projection (on all n_tokens if all_logits, else only the last token)
     if (need_logits) {
         Probe p("final_norm_and_lm_head");
-        float *x_last = s->x + (size_t)(n_tokens - 1) * n_embd;
-        float *w = (float *)get_tensor_data(llama->model, llama->output_norm->name);
-        rmsnorm(x_last, x_last, w, n_embd, llama->hparams.rms_norm_eps);
-        matvec_tensor(s->logits, llama, llama->output, x_last, s->n_vocab, n_embd, s->q8_buf);
+        const float *w = (const float *)get_tensor_data(llama->model, llama->output_norm->name);
+        if (all_logits) {
+            for (int t = 0; t < n_tokens; t++) {
+                rmsnorm(s->x + (size_t)t * n_embd, s->x + (size_t)t * n_embd, w, n_embd, llama->hparams.rms_norm_eps);
+            }
+            matmul_tensor(s->logits, llama, llama->output, s->x, n_tokens, s->n_vocab, n_embd, s->q8_buf);
+        } else {
+            float *x_last = s->x + (size_t)(n_tokens - 1) * n_embd;
+            rmsnorm(x_last, x_last, w, n_embd, llama->hparams.rms_norm_eps);
+            matvec_tensor(s->logits, llama, llama->output, x_last, s->n_vocab, n_embd, s->q8_buf);
+        }
     }
 }
 
@@ -502,10 +510,11 @@ void prefill(LlamaModel *llama, InferState *s, const int *tokens, int n_tokens) 
 }
 
 // ── argmax_token ──
-int argmax_token(const InferState *s) {
+int argmax_token(const InferState *s, int token_idx) {
+    const float *row = s->logits + (size_t)token_idx * s->n_vocab;
     int best = 0;
     for (int i = 1; i < s->n_vocab; i++) {
-        if (s->logits[i] > s->logits[best]) best = i;
+        if (row[i] > row[best]) best = i;
     }
     return best;
 }
