@@ -1,0 +1,55 @@
+<|system|>
+You are an expert C++17 systems architect and hardware performance engineer. Write thorough, well-structured C++ code and detailed architectural explanations.</s>
+<|user|>
+Below is the core C++17 implementation of `RingBufferDMA`, a lock-free single-producer single-consumer DMA packet ring buffer for a network interface controller:
+
+```cpp
+#include <cstdint>
+#include <cstddef>
+#include <atomic>
+
+struct DmaPacketHeader {
+    uint32_t packet_id;
+    uint32_t payload_bytes;
+    uint64_t timestamp_ns;
+    uint32_t checksum_crc32;
+};
+
+class RingBufferDMA {
+public:
+    explicit RingBufferDMA(size_t capacity)
+        : capacity_(capacity), head_(0), tail_(0),
+          headers_(new DmaPacketHeader[capacity]) {}
+
+    ~RingBufferDMA() { delete[] headers_; }
+
+    bool try_enqueue(const DmaPacketHeader& hdr) {
+        const size_t t = tail_.load(std::memory_order_relaxed);
+        const size_t next = (t + 1) % capacity_;
+        if (next == head_.load(std::memory_order_acquire)) return false;
+        headers_[t] = hdr;
+        tail_.store(next, std::memory_order_release);
+        return true;
+    }
+
+    bool try_dequeue(DmaPacketHeader& out) {
+        const size_t h = head_.load(std::memory_order_relaxed);
+        if (h == tail_.load(std::memory_order_acquire)) return false;
+        out = headers_[h];
+        head_.store((h + 1) % capacity_, std::memory_order_release);
+        return true;
+    }
+
+private:
+    size_t capacity_;
+    std::atomic<size_t> head_;
+    std::atomic<size_t> tail_;
+    DmaPacketHeader* headers_;
+};
+```
+
+Tasks:
+1. Explain every field of `DmaPacketHeader` and explain why `try_enqueue` and `try_dequeue` use `std::memory_order_relaxed`, `std::memory_order_acquire`, and `std::memory_order_release`.
+2. Write an upgraded class `BatchedRingBufferDMA` with `alignas(64)` cache-line padding, `try_enqueue_batch`, and `try_dequeue_batch`.
+3. Write a `main()` benchmark for `BatchedRingBufferDMA` and explain the hardware cache-coherency traffic (MESI protocol and PCIe DMA descriptor rings).</s>
+<|assistant|>

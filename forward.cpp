@@ -2,9 +2,11 @@
 #include "ops.h"
 #include "dequant.h"
 #include "probe.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 
 // Helper: dequantize a named tensor into a freshly calloc'd float buffer.
@@ -421,8 +423,10 @@ void forward_batch(LlamaModel *llama, InferState *s, const int *tokens, int n_to
     }
 
     int n_embd = s->n_embd;
-    // Record the last token position of this batch in the probe context
-    probe_set_pos(start_pos + n_tokens - 1);
+    // Record the token position of this batch in the probe context:
+    // - prefill (!all_logits): record last token of chunk (start_pos + n_tokens - 1)
+    // - speculative decode (all_logits): record start_pos (strictly monotonic with accepted pos)
+    probe_set_pos(all_logits ? start_pos : (start_pos + n_tokens - 1));
 
     // 1. Embedding lookup for all n_tokens
     {
@@ -519,10 +523,37 @@ int argmax_token(const InferState *s, int token_idx) {
     return best;
 }
 
+// ── draft_ngram ──
+// Zero-weight Prompt-Lookup / N-Gram speculative drafter.
+// Searches `history[0..len-1]` from most recent to oldest for a matching 3-gram
+// ending at `history[len - 1]`. Using a 3-gram minimum avoids false-positive
+// B=4 verification steps on generic 2-grams (like ", the" or ", and").
+// Copies up to `max_draft` continuation tokens into `draft_out` and returns count in [0, max_draft].
+static int draft_ngram(const int *history, int len, int max_draft, int *draft_out) {
+    constexpr int ngram = 3;
+    if (max_draft <= 0 || len <= ngram) return 0;
+    const int *suffix = history + (len - ngram);
+    for (int i = len - ngram - 1; i >= 0; i--) {
+        if (history[i] == suffix[0] && history[i + 1] == suffix[1] && history[i + 2] == suffix[2]) {
+            int match_next = i + ngram;
+            int avail = len - match_next;
+            int k = (avail < max_draft) ? avail : max_draft;
+            for (int j = 0; j < k; j++) {
+                draft_out[j] = history[match_next + j];
+            }
+            return k;
+        }
+    }
+    return 0;
+}
+
 // ── generate ──
-// After prefill, s->logits holds the distribution for the token that follows
-// the prompt. Each iteration: sample it, then forward it at the next position
-// (which also appends its K/V to the cache) to get logits for the one after.
+// Greedy autoregressive generation with N-Gram Speculative Decoding (B=4 parallel verification).
+//   1. prefill(prompt) -> s->logits[0] holds the distribution for the first generated token
+//   2. Emit the first token `cur_tok`, then in each decode step:
+//      - Draft up to `spec_k` (default 3) continuation tokens from `history` via N-gram lookup
+//      - Feed `[cur_tok, draft_1, ..., draft_k]` (`B = 1 + k <= 4`) into `forward_batch(..., all_logits=true)`
+//      - Greedily verify `argmax_token(s, t)` for t = 0..k, accepting up to 4 tokens in a single weight pass!
 int generate(LlamaModel *llama, InferState *s,
              const int *prompt, int n_prompt,
              int max_new, int eos_id,
@@ -534,34 +565,107 @@ int generate(LlamaModel *llama, InferState *s,
         prefill(llama, s, prompt, n_prompt);
     }
 
-    int pos = n_prompt;  // position the next generated token will occupy
-    int n_generated = 0;
+    if (max_new <= 0) {
+        probe_set_pos(-1);
+        probe_set_phase("");
+        return 0;
+    }
 
-    // One sample per generated token, stored with its token position.
+    int spec_k = 3; // Default: draft up to 3 tokens -> B=4 verification batch
+    if (const char *env_k = getenv("NANO_SPEC_K")) {
+        int k = atoi(env_k);
+        if (k >= 0 && k < s->max_batch) spec_k = k;
+    }
+
+    std::vector<int> history(prompt, prompt + n_prompt);
+    int pos = n_prompt;  // sequence position of `cur_tok` (to be forwarded next)
+    int n_generated = 0;
+    int n_steps = 0;
+    int n_drafted = 0;
+    int n_accepted = 0;
+
     probe_set_phase("decode");
     ProbeAccum pa_argmax ("decode:argmax");
     ProbeAccum pa_forward("decode:forward_token");
 
-    while (n_generated < max_new) {
+    // Sample the very first generated token from prefill's final logits
+    probe_set_pos(pos);
+    int cur_tok;
+    {
+        auto t = pa_argmax.start();
+        cur_tok = argmax_token(s, 0);
+        pa_argmax.stop(t);
+    }
+    if (cur_tok == eos_id) {
+        probe_set_pos(-1);
+        probe_set_phase("");
+        return 0;
+    }
+    if (on_token) on_token(cur_tok, user);
+    n_generated++;
+    history.push_back(cur_tok);
+
+    int batch[InferState::MAX_BATCH];
+    bool hit_eos = false;
+
+    while (n_generated < max_new && pos < s->n_ctx && !hit_eos) {
         probe_set_pos(pos);
-        int next;
-        {
-            auto t = pa_argmax.start();
-            next = argmax_token(s);
-            pa_argmax.stop(t);
-        }
-        if (next == eos_id) break;
 
-        if (on_token) on_token(next, user);
-        n_generated++;
+        int max_k = std::min({spec_k, s->n_ctx - pos - 1, max_new - n_generated - 1});
+        batch[0] = cur_tok;
+        int k = draft_ngram(history.data(), (int)history.size(), max_k, batch + 1);
+        int B = 1 + k;
 
-        if (pos >= s->n_ctx) break;  // context window full
+        n_steps++;
+        n_drafted += k;
+
         {
             auto t = pa_forward.start();
-            forward_token(llama, s, next, pos, true);
+            forward_batch(llama, s, batch, B, pos, true, /*all_logits=*/true);
             pa_forward.stop(t);
         }
-        pos++;
+
+        // Verify drafted tokens against greedy target argmax at each position t = 0..k
+        for (int t = 0; t <= k; t++) {
+            probe_set_pos(pos + t);
+            int next;
+            {
+                auto ta = pa_argmax.start();
+                next = argmax_token(s, t);
+                pa_argmax.stop(ta);
+            }
+            if (t > 0) {
+                memcpy(s->logits, s->logits + (size_t)t * s->n_vocab, (size_t)s->n_vocab * sizeof(float));
+            }
+            if (next == eos_id) {
+                hit_eos = true;
+                pos += t + 1;
+                break;
+            }
+
+            if (on_token) on_token(next, user);
+            n_generated++;
+            history.push_back(next);
+            cur_tok = next;
+
+            if (t < k && next == batch[t + 1]) {
+                n_accepted++;
+                if (n_generated >= max_new) {
+                    pos += t + 1;
+                    break;
+                }
+            } else {
+                pos += t + 1;
+                break;
+            }
+        }
+    }
+
+    if (n_steps > 0) {
+        double accept_pct = (n_drafted > 0) ? (100.0 * n_accepted / n_drafted) : 0.0;
+        double tok_per_step = (double)(n_steps + n_accepted) / n_steps;
+        fprintf(stderr, "\n[SPEC] steps=%d, forward_tokens_emitted=%d (%.2f tok/step), drafted=%d, accepted=%d (%.1f%%)\n",
+                n_steps, n_steps + n_accepted, tok_per_step, n_drafted, n_accepted, accept_pct);
     }
 
     probe_set_pos(-1);
