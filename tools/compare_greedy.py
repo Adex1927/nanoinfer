@@ -62,7 +62,7 @@ def tokenize_prompt(prompt, model_path, tokenize_bin):
     return tokens
 
 
-def run_llamacpp(model_path, prompt, prompt_file, n_predict, completion_bin):
+def run_llamacpp(model_path, prompt, prompt_file, n_predict, completion_bin, ctk=None, ctv=None):
     """Run llama-completion with greedy sampling (--temp 0).
 
     If prompt_file is set it is passed with -f (same newline handling as
@@ -79,7 +79,12 @@ def run_llamacpp(model_path, prompt, prompt_file, n_predict, completion_bin):
         "-n", str(n_predict),
         "--no-warmup",
         "-no-cnv",
+        "--device", "none",
     ]
+    if ctk:
+        cmd += ["-ctk", ctk]
+    if ctv:
+        cmd += ["-ctv", ctv]
 
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0:
@@ -147,6 +152,9 @@ def main():
                         help="Prompt file used when -p is not given (default: prompt.txt in the repo root)")
     parser.add_argument("-n", "--n-predict", type=int, default=20, help="Number of tokens to generate (default: 20)")
     parser.add_argument("--compare", action="store_true", help="Also run nanoinfer and compare outputs side-by-side")
+    default_ctk = "f16" if os.environ.get("NANO_KV_Q8") == "0" else "q8_0"
+    parser.add_argument("--ctk", default=default_ctk, help="llama.cpp K-cache type (-ctk, default: q8_0 or f16 if NANO_KV_Q8=0)")
+    parser.add_argument("--ctv", default=default_ctk, help="llama.cpp V-cache type (-ctv, default: q8_0 or f16 if NANO_KV_Q8=0)")
     parser.add_argument("--completion-bin", default=DEFAULT_COMPLETION, help="Path to llama-completion binary")
     parser.add_argument("--tokenize-bin", default=DEFAULT_TOKENIZE, help="Path to llama-tokenize binary")
     parser.add_argument("--nanoinfer-bin", default=DEFAULT_NANOINFER, help="Path to nanoinfer model_test binary")
@@ -165,10 +173,10 @@ def main():
     if prompt_file:
         print(f"Prompt file: {prompt_file}")
     print(f"Prompt: {repr(prompt)}")
-    print(f"Generating {args.n_predict} tokens (greedy, temp=0)...\n")
+    print(f"Generating {args.n_predict} tokens (greedy, temp=0, ctk={args.ctk}, ctv={args.ctv})...\n")
 
     # 1. llama.cpp output
-    llama_out = run_llamacpp(args.model, prompt, prompt_file, args.n_predict, args.completion_bin)
+    llama_out = run_llamacpp(args.model, prompt, prompt_file, args.n_predict, args.completion_bin, ctk=args.ctk, ctv=args.ctv)
 
     print("=" * 60)
     print(" [llama.cpp output]")
