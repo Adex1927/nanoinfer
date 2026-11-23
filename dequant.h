@@ -137,6 +137,10 @@ static inline uint16_t f32_to_f16(float f) {
 // n_elements must be a multiple of 32.
 void quantize_q8_0(const float *src, BlockQ8_0 *dst, size_t n_elements);
 
+// Convert an array of float32 values to float16 (stored as uint16_t) and back.
+void quantize_f16(const float *src, uint16_t *dst, size_t n_elements);
+void dequantize_f16(const uint16_t *src, float *dst, size_t n_elements);
+
 // Dequantize a Q8_0 tensor: reads n_elements from src, writes floats to dst.
 // dst must be pre-allocated with n_elements floats.
 void dequantize_q8_0(const void *src, float *dst, size_t n_elements);

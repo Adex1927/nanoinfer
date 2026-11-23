@@ -52,9 +52,9 @@ InferState *alloc_infer_state(const LlamaHparams *hp) {
 
     // ── KV cache ──
     // For TinyLlama (n_layers=22, n_ctx=2048, kv_dim=256):
-    //   - float32: 22 * 2048 * 256 * 4 bytes = ~46.1 MB per cache (92.2 MB total)
-    //   - Q8_0 KV: 22 * 2048 * (256/32) * 34 bytes = ~12.25 MB per cache (24.5 MB total, 3.76x smaller)
-    // Controlled by NANO_KV_Q8 (default: 1 = Q8_0 k_cache & v_cache, 0 = float32 k_cache & v_cache).
+    //   - float32:        22 * 2048 * 256 * 4 bytes = ~46.1 MB per cache (92.2 MB total)
+    //   - Q8_0 K + F16 V: 12.25 MB (Q8_0 K) + 23.04 MB (FP16 V) = 35.3 MB total (2.61x smaller)
+    // Controlled by NANO_KV_Q8 (default: 1 = Q8_0 k_cache & FP16 v_cache, 0 = float32 k_cache & v_cache).
     s->kv_q8 = true;
     if (const char *env_kv = getenv("NANO_KV_Q8")) {
         s->kv_q8 = (atoi(env_kv) != 0);
@@ -63,11 +63,11 @@ InferState *alloc_infer_state(const LlamaHparams *hp) {
     size_t kv_cache_size = (size_t)s->n_layers * s->n_ctx * s->kv_dim;
     if (s->kv_q8) {
         size_t kv_blocks = kv_cache_size / 32;
-        s->k_cache_q8 = (BlockQ8_0 *)calloc(kv_blocks, sizeof(BlockQ8_0));
-        s->v_cache_q8 = (BlockQ8_0 *)calloc(kv_blocks, sizeof(BlockQ8_0));
+        s->k_cache_q8  = (BlockQ8_0 *)calloc(kv_blocks, sizeof(BlockQ8_0));
+        s->v_cache_f16 = (uint16_t *)calloc(kv_cache_size, sizeof(uint16_t));
     } else {
-        s->k_cache    = (float *)calloc(kv_cache_size, sizeof(float));
-        s->v_cache    = (float *)calloc(kv_cache_size, sizeof(float));
+        s->k_cache     = (float *)calloc(kv_cache_size, sizeof(float));
+        s->v_cache     = (float *)calloc(kv_cache_size, sizeof(float));
     }
 
     // ── Quantized activation scratch buffer ──
@@ -76,7 +76,7 @@ InferState *alloc_infer_state(const LlamaHparams *hp) {
     s->q8_buf = (BlockQ8_K *)calloc(B * q8_blocks, sizeof(BlockQ8_K));
 
     // basic allocation check
-    bool kv_ok = s->kv_q8 ? (s->k_cache_q8 != nullptr && s->v_cache_q8 != nullptr)
+    bool kv_ok = s->kv_q8 ? (s->k_cache_q8 != nullptr && s->v_cache_f16 != nullptr)
                           : (s->k_cache != nullptr && s->v_cache != nullptr);
     if (!s->x || !s->xb || !s->xb2 || !s->q || !s->k || !s->v ||
         !s->att || !s->hb || !s->hb2 || !s->logits || !kv_ok || !s->q8_buf) {
@@ -106,6 +106,6 @@ void free_infer_state(InferState *s) {
     free(s->k_cache);
     free(s->v_cache);
     free(s->k_cache_q8);
-    free(s->v_cache_q8);
+    free(s->v_cache_f16);
     free(s);
 }

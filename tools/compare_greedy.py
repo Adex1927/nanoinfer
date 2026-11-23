@@ -154,7 +154,7 @@ def main():
     parser.add_argument("--compare", action="store_true", help="Also run nanoinfer and compare outputs side-by-side")
     default_ctk = "f16" if os.environ.get("NANO_KV_Q8") == "0" else "q8_0"
     parser.add_argument("--ctk", default=default_ctk, help="llama.cpp K-cache type (-ctk, default: q8_0 or f16 if NANO_KV_Q8=0)")
-    parser.add_argument("--ctv", default=default_ctk, help="llama.cpp V-cache type (-ctv, default: q8_0 or f16 if NANO_KV_Q8=0)")
+    parser.add_argument("--ctv", default="f16", help="llama.cpp V-cache type (-ctv, default: f16)")
     parser.add_argument("--completion-bin", default=DEFAULT_COMPLETION, help="Path to llama-completion binary")
     parser.add_argument("--tokenize-bin", default=DEFAULT_TOKENIZE, help="Path to llama-tokenize binary")
     parser.add_argument("--nanoinfer-bin", default=DEFAULT_NANOINFER, help="Path to nanoinfer model_test binary")

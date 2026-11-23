@@ -2,6 +2,7 @@
 #define OPS_H
 
 #include <cstddef>
+#include <cstdint>
 
 // ── RMSNorm ──
 // Applies Root Mean Square Layer Normalization.
@@ -144,5 +145,10 @@ void mha_decode_q8_kv(float *xb, const float *q,
                       const BlockQ8_0 *k_cache_layer, const BlockQ8_0 *v_cache_layer,
                       float *att_scratch, int pos,
                       int n_heads, int n_kv_heads, int head_dim, int kv_dim, int n_ctx);
+
+void mha_decode_q8k_f16v(float *xb, const float *q,
+                         const BlockQ8_0 *k_cache_layer, const uint16_t *v_cache_layer,
+                         float *att_scratch, int pos,
+                         int n_heads, int n_kv_heads, int head_dim, int kv_dim, int n_ctx);
 
 #endif // OPS_H

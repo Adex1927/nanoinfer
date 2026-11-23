@@ -411,6 +411,79 @@ static void test_mha_decode_q8_kv() {
     }
 }
 
+static void test_mha_decode_q8k_f16v() {
+    printf("Testing mha_decode_q8k_f16v... ");
+
+    const int n_heads = 32;
+    const int n_kv_heads = 4;
+    const int head_dim = 64;
+    const int kv_dim = n_kv_heads * head_dim; // 256
+    const int n_ctx = 128;
+    const int pos = 63; // test attention across 64 tokens
+
+    std::vector<float> q(n_heads * head_dim);
+    for (size_t i = 0; i < q.size(); i++) {
+        q[i] = sinf((float)i * 0.05f) * 0.5f;
+    }
+
+    std::vector<float> k_cache_f32(n_ctx * kv_dim);
+    std::vector<float> v_cache_f32(n_ctx * kv_dim);
+    for (size_t i = 0; i < k_cache_f32.size(); i++) {
+        k_cache_f32[i] = cosf((float)i * 0.03f) * 0.4f;
+        v_cache_f32[i] = sinf((float)i * 0.07f) * 0.6f;
+    }
+
+    // Quantize k_cache into BlockQ8_0 and v_cache into FP16
+    std::vector<BlockQ8_0> k_cache_q8((n_ctx * kv_dim) / 32);
+    std::vector<uint16_t>  v_cache_f16(n_ctx * kv_dim);
+    quantize_q8_0(k_cache_f32.data(), k_cache_q8.data(),  k_cache_f32.size());
+    quantize_f16 (v_cache_f32.data(), v_cache_f16.data(), v_cache_f32.size());
+
+    // 1. Float32 reference mha_decode
+    std::vector<float> att_ref(n_heads * n_ctx, 0.0f);
+    std::vector<float> xb_ref(n_heads * head_dim, 0.0f);
+    mha_decode(xb_ref.data(), q.data(), k_cache_f32.data(), v_cache_f32.data(),
+               att_ref.data(), pos, n_heads, n_kv_heads, head_dim, kv_dim, n_ctx);
+
+    // 2. Reconstructed reference (exact dequantized Q_q8 . K_q8 and Attn . V_f16)
+    std::vector<float> q_recon(q.size());
+    std::vector<BlockQ8_0> q_q8(q.size() / 32);
+    quantize_q8_0(q.data(), q_q8.data(), q.size());
+    dequantize_q8_0(q_q8.data(), q_recon.data(), q.size());
+
+    std::vector<float> k_recon(k_cache_f32.size());
+    std::vector<float> v_recon(v_cache_f32.size());
+    dequantize_q8_0(k_cache_q8.data(),  k_recon.data(), k_cache_f32.size());
+    dequantize_f16 (v_cache_f16.data(), v_recon.data(), v_cache_f32.size());
+
+    std::vector<float> att_recon(n_heads * n_ctx, 0.0f);
+    std::vector<float> xb_recon(n_heads * head_dim, 0.0f);
+    mha_decode(xb_recon.data(), q_recon.data(), k_recon.data(), v_recon.data(),
+               att_recon.data(), pos, n_heads, n_kv_heads, head_dim, kv_dim, n_ctx);
+
+    // 3. Fused mha_decode_q8k_f16v kernel
+    std::vector<float> att_test(n_heads * n_ctx, 0.0f);
+    std::vector<float> xb_test(n_heads * head_dim, 0.0f);
+    mha_decode_q8k_f16v(xb_test.data(), q.data(), k_cache_q8.data(), v_cache_f16.data(),
+                        att_test.data(), pos, n_heads, n_kv_heads, head_dim, kv_dim, n_ctx);
+
+    float max_recon_diff = 0.0f;
+    float max_ref_diff   = 0.0f;
+    for (size_t i = 0; i < xb_test.size(); i++) {
+        float d_recon = fabsf(xb_recon[i] - xb_test[i]);
+        float d_ref   = fabsf(xb_ref[i]   - xb_test[i]);
+        if (d_recon > max_recon_diff) max_recon_diff = d_recon;
+        if (d_ref   > max_ref_diff)   max_ref_diff   = d_ref;
+    }
+
+    bool pass = (max_recon_diff < 1e-5f) && (max_ref_diff < 1e-4f);
+    printf("recon_diff = %e, f32_ref_diff = %e -> %s\n",
+           max_recon_diff, max_ref_diff, pass ? "PASS" : "FAIL");
+    if (!pass) {
+        exit(1);
+    }
+}
+
 static void test_mha_decode() {
     printf("Testing mha_decode... ");
 
@@ -602,6 +675,7 @@ int main() {
     test_mha_decode();
     test_mha_decode_q8_k();
     test_mha_decode_q8_kv();
+    test_mha_decode_q8k_f16v();
     test_matmul_q4_k();
     test_matmul_q6_k();
     return 0;

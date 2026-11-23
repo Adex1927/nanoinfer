@@ -80,6 +80,44 @@ void quantize_q8_0(const float *src, BlockQ8_0 *dst, size_t n_elements) {
     }
 }
 
+// ── quantize_f16 / dequantize_f16 ──
+// Hardware-accelerated FP32 <-> FP16 batch conversion (2 bytes per element).
+void quantize_f16(const float *src, uint16_t *dst, size_t n_elements) {
+#if defined(__ARM_NEON)
+    size_t i = 0;
+    for (; i + 8 <= n_elements; i += 8) {
+        float16x4_t lo = vcvt_f16_f32(vld1q_f32(src + i));
+        float16x4_t hi = vcvt_f16_f32(vld1q_f32(src + i + 4));
+        vst1q_u16(dst + i, vreinterpretq_u16_f16(vcombine_f16(lo, hi)));
+    }
+    for (; i < n_elements; i++) {
+        dst[i] = f32_to_f16(src[i]);
+    }
+#else
+    for (size_t i = 0; i < n_elements; i++) {
+        dst[i] = f32_to_f16(src[i]);
+    }
+#endif
+}
+
+void dequantize_f16(const uint16_t *src, float *dst, size_t n_elements) {
+#if defined(__ARM_NEON)
+    size_t i = 0;
+    for (; i + 8 <= n_elements; i += 8) {
+        float16x8_t h = vreinterpretq_f16_u16(vld1q_u16(src + i));
+        vst1q_f32(dst + i,     vcvt_f32_f16(vget_low_f16(h)));
+        vst1q_f32(dst + i + 4, vcvt_f32_f16(vget_high_f16(h)));
+    }
+    for (; i < n_elements; i++) {
+        dst[i] = f16_to_f32(src[i]);
+    }
+#else
+    for (size_t i = 0; i < n_elements; i++) {
+        dst[i] = f16_to_f32(src[i]);
+    }
+#endif
+}
+
 // ── dequantize_q8_0 ──
 // The simplest one. Each block = 34 bytes = [float16 scale][32 × int8]
 // For each weight: float_value = scale * quant_value
