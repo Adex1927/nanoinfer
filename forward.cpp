@@ -82,13 +82,19 @@ static void matmul_tensor(float *out, LlamaModel *llama, TensorInfo *info,
 }
 
 // ── cache_kv ──
-// Copies n_tokens K and V vectors from s->k and s->v into layer's KV cache starting at start_pos.
+// Copies/quantizes n_tokens K and V vectors from s->k and s->v into layer's KV cache starting at start_pos.
 static void cache_kv(InferState *s, int layer, int start_pos, int n_tokens) {
     int kv_dim = s->kv_dim;
     int n_ctx  = s->n_ctx;
-    float *k_dst = s->k_cache + (size_t)layer * n_ctx * kv_dim + (size_t)start_pos * kv_dim;
+    if (s->kv_q8) {
+        int kv_blocks = kv_dim / 32;
+        BlockQ8_0 *k_dst = s->k_cache_q8 + ((size_t)layer * n_ctx + start_pos) * kv_blocks;
+        quantize_q8_0(s->k, k_dst, (size_t)n_tokens * kv_dim);
+    } else {
+        float *k_dst = s->k_cache + (size_t)layer * n_ctx * kv_dim + (size_t)start_pos * kv_dim;
+        memcpy(k_dst, s->k, (size_t)n_tokens * kv_dim * sizeof(float));
+    }
     float *v_dst = s->v_cache + (size_t)layer * n_ctx * kv_dim + (size_t)start_pos * kv_dim;
-    memcpy(k_dst, s->k, (size_t)n_tokens * kv_dim * sizeof(float));
     memcpy(v_dst, s->v, (size_t)n_tokens * kv_dim * sizeof(float));
 }
 
@@ -104,11 +110,17 @@ void mha(InferState *s, int layer, int pos) {
     cache_kv(s, layer, pos, 1);
 
     // 2. Compute multi-head attention (fused ops kernel)
-    const float *k_layer = s->k_cache + (size_t)layer * n_ctx * kv_dim;
     const float *v_layer = s->v_cache + (size_t)layer * n_ctx * kv_dim;
-
-    mha_decode(s->xb, s->q, k_layer, v_layer, s->att, pos,
-               s->n_heads, s->n_kv_heads, s->head_dim, s->kv_dim, s->n_ctx);
+    if (s->kv_q8) {
+        int kv_blocks = kv_dim / 32;
+        const BlockQ8_0 *k_layer = s->k_cache_q8 + (size_t)layer * n_ctx * kv_blocks;
+        mha_decode_q8_k(s->xb, s->q, k_layer, v_layer, s->att, pos,
+                        s->n_heads, s->n_kv_heads, s->head_dim, s->kv_dim, s->n_ctx);
+    } else {
+        const float *k_layer = s->k_cache + (size_t)layer * n_ctx * kv_dim;
+        mha_decode(s->xb, s->q, k_layer, v_layer, s->att, pos,
+                   s->n_heads, s->n_kv_heads, s->head_dim, s->kv_dim, s->n_ctx);
+    }
 }
 
 void mha_batch(InferState *s, int layer, int start_pos, int n_tokens) {
@@ -120,14 +132,24 @@ void mha_batch(InferState *s, int layer, int start_pos, int n_tokens) {
     cache_kv(s, layer, start_pos, n_tokens);
 
     // 2. Causal multi-head attention for each token t at sequence position (start_pos + t)
-    const float *k_layer = s->k_cache + (size_t)layer * n_ctx * kv_dim;
     const float *v_layer = s->v_cache + (size_t)layer * n_ctx * kv_dim;
-
-    for (int t = 0; t < n_tokens; t++) {
-        mha_decode(s->xb + (size_t)t * n_embd,
-                   s->q  + (size_t)t * n_embd,
-                   k_layer, v_layer, s->att, start_pos + t,
-                   s->n_heads, s->n_kv_heads, s->head_dim, kv_dim, n_ctx);
+    if (s->kv_q8) {
+        int kv_blocks = kv_dim / 32;
+        const BlockQ8_0 *k_layer = s->k_cache_q8 + (size_t)layer * n_ctx * kv_blocks;
+        for (int t = 0; t < n_tokens; t++) {
+            mha_decode_q8_k(s->xb + (size_t)t * n_embd,
+                            s->q  + (size_t)t * n_embd,
+                            k_layer, v_layer, s->att, start_pos + t,
+                            s->n_heads, s->n_kv_heads, s->head_dim, kv_dim, n_ctx);
+        }
+    } else {
+        const float *k_layer = s->k_cache + (size_t)layer * n_ctx * kv_dim;
+        for (int t = 0; t < n_tokens; t++) {
+            mha_decode(s->xb + (size_t)t * n_embd,
+                       s->q  + (size_t)t * n_embd,
+                       k_layer, v_layer, s->att, start_pos + t,
+                       s->n_heads, s->n_kv_heads, s->head_dim, kv_dim, n_ctx);
+        }
     }
 }
 

@@ -114,6 +114,29 @@ static inline float f16_to_f32(uint16_t h) {
 #endif
 }
 
+// Convert float32 to float16 (IEEE 754 binary16)
+static inline uint16_t f32_to_f16(float f) {
+#if defined(__ARM_NEON)
+    __fp16 f16 = (__fp16)f;
+    uint16_t h;
+    __builtin_memcpy(&h, &f16, sizeof(h));
+    return h;
+#else
+    uint32_t x;
+    __builtin_memcpy(&x, &f, sizeof(x));
+    uint32_t sign = (x >> 16) & 0x8000;
+    int32_t  exp  = ((x >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = (x >> 13) & 0x3FF;
+    if (exp <= 0) return (uint16_t)sign;
+    if (exp >= 31) return (uint16_t)(sign | 0x7C00);
+    return (uint16_t)(sign | (exp << 10) | mant);
+#endif
+}
+
+// Quantize float values into BlockQ8_0 blocks (32 elements per block).
+// n_elements must be a multiple of 32.
+void quantize_q8_0(const float *src, BlockQ8_0 *dst, size_t n_elements);
+
 // Dequantize a Q8_0 tensor: reads n_elements from src, writes floats to dst.
 // dst must be pre-allocated with n_elements floats.
 void dequantize_q8_0(const void *src, float *dst, size_t n_elements);

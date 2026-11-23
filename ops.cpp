@@ -1152,3 +1152,133 @@ void mha_decode(float *xb, const float *q,
         }
     }
 }
+
+// ── Multi-Head Attention (MHA Decode with Q8_0 K Cache) ──
+void mha_decode_q8_k(float *xb, const float *q,
+                     const BlockQ8_0 *k_cache_layer, const float *v_cache_layer,
+                     float *att_scratch, int pos,
+                     int n_heads, int n_kv_heads, int head_dim, int kv_dim, int n_ctx) {
+    int heads_per_group = n_heads / n_kv_heads;
+    int head_blocks     = head_dim / 32; // 2 blocks for head_dim = 64
+    int kv_blocks       = kv_dim / 32;   // 8 blocks for kv_dim = 256
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    auto process_head = [&](int h) {
+        int kv_head = h / heads_per_group;
+
+        const float *qh    = q           + h * head_dim;
+        float       *att_h = att_scratch + h * n_ctx;
+        float       *xbh   = xb          + h * head_dim;
+
+        // Quantize the 64-element query head once into 2 BlockQ8_0 blocks,
+        // and keep all 64 int8 query elements pinned in 4 NEON registers across t = 0..pos.
+        BlockQ8_0 q_blk[2];
+        quantize_q8_0(qh, q_blk, head_dim);
+        float dq0 = f16_to_f32(q_blk[0].scale) * scale;
+        float dq1 = f16_to_f32(q_blk[1].scale) * scale;
+
+        const BlockQ8_0 *k_head = k_cache_layer + kv_head * head_blocks;
+
+#if defined(__ARM_FEATURE_DOTPROD)
+        int8x16_t q0_lo = vld1q_s8(q_blk[0].quants + 0);
+        int8x16_t q0_hi = vld1q_s8(q_blk[0].quants + 16);
+        int8x16_t q1_lo = vld1q_s8(q_blk[1].quants + 0);
+        int8x16_t q1_hi = vld1q_s8(q_blk[1].quants + 16);
+
+        // Step 2: dot-product scores (Q_q8 . K_cache_q8) using NEON SDOT
+        for (int t = 0; t <= pos; t++) {
+            const BlockQ8_0 *kt = k_head + (size_t)t * kv_blocks;
+
+            int32x4_t dot0 = vdotq_s32(vdupq_n_s32(0), q0_lo, vld1q_s8(kt[0].quants + 0));
+            dot0           = vdotq_s32(dot0,            q0_hi, vld1q_s8(kt[0].quants + 16));
+
+            int32x4_t dot1 = vdotq_s32(vdupq_n_s32(0), q1_lo, vld1q_s8(kt[1].quants + 0));
+            dot1           = vdotq_s32(dot1,            q1_hi, vld1q_s8(kt[1].quants + 16));
+
+            float dk0 = f16_to_f32(kt[0].scale);
+            float dk1 = f16_to_f32(kt[1].scale);
+            att_h[t] = (float)vaddvq_s32(dot0) * (dq0 * dk0)
+                     + (float)vaddvq_s32(dot1) * (dq1 * dk1);
+        }
+#else
+        for (int t = 0; t <= pos; t++) {
+            const BlockQ8_0 *kt = k_head + (size_t)t * kv_blocks;
+            int32_t s0 = 0, s1 = 0;
+            for (int j = 0; j < 32; j++) {
+                s0 += (int32_t)q_blk[0].quants[j] * (int32_t)kt[0].quants[j];
+                s1 += (int32_t)q_blk[1].quants[j] * (int32_t)kt[1].quants[j];
+            }
+            float dk0 = f16_to_f32(kt[0].scale);
+            float dk1 = f16_to_f32(kt[1].scale);
+            att_h[t] = (float)s0 * (dq0 * dk0) + (float)s1 * (dq1 * dk1);
+        }
+#endif
+
+        // Step 3: softmax over scores[0..pos]
+        softmax(att_h, att_h, pos + 1);
+
+        // Step 4: weighted sum of value vectors (Attn . V_cache in float32)
+        const float *v_head = v_cache_layer + kv_head * head_dim;
+#if defined(__ARM_NEON)
+        float32x4_t vacc0  = vdupq_n_f32(0.0f); float32x4_t vacc1  = vdupq_n_f32(0.0f);
+        float32x4_t vacc2  = vdupq_n_f32(0.0f); float32x4_t vacc3  = vdupq_n_f32(0.0f);
+        float32x4_t vacc4  = vdupq_n_f32(0.0f); float32x4_t vacc5  = vdupq_n_f32(0.0f);
+        float32x4_t vacc6  = vdupq_n_f32(0.0f); float32x4_t vacc7  = vdupq_n_f32(0.0f);
+        float32x4_t vacc8  = vdupq_n_f32(0.0f); float32x4_t vacc9  = vdupq_n_f32(0.0f);
+        float32x4_t vacc10 = vdupq_n_f32(0.0f); float32x4_t vacc11 = vdupq_n_f32(0.0f);
+        float32x4_t vacc12 = vdupq_n_f32(0.0f); float32x4_t vacc13 = vdupq_n_f32(0.0f);
+        float32x4_t vacc14 = vdupq_n_f32(0.0f); float32x4_t vacc15 = vdupq_n_f32(0.0f);
+
+        for (int t = 0; t <= pos; t++) {
+            const float *vt = v_head + t * kv_dim;
+            float32x4_t w = vdupq_n_f32(att_h[t]);
+            vacc0  = vfmaq_f32(vacc0,  w, vld1q_f32(vt + 0));
+            vacc1  = vfmaq_f32(vacc1,  w, vld1q_f32(vt + 4));
+            vacc2  = vfmaq_f32(vacc2,  w, vld1q_f32(vt + 8));
+            vacc3  = vfmaq_f32(vacc3,  w, vld1q_f32(vt + 12));
+            vacc4  = vfmaq_f32(vacc4,  w, vld1q_f32(vt + 16));
+            vacc5  = vfmaq_f32(vacc5,  w, vld1q_f32(vt + 20));
+            vacc6  = vfmaq_f32(vacc6,  w, vld1q_f32(vt + 24));
+            vacc7  = vfmaq_f32(vacc7,  w, vld1q_f32(vt + 28));
+            vacc8  = vfmaq_f32(vacc8,  w, vld1q_f32(vt + 32));
+            vacc9  = vfmaq_f32(vacc9,  w, vld1q_f32(vt + 36));
+            vacc10 = vfmaq_f32(vacc10, w, vld1q_f32(vt + 40));
+            vacc11 = vfmaq_f32(vacc11, w, vld1q_f32(vt + 44));
+            vacc12 = vfmaq_f32(vacc12, w, vld1q_f32(vt + 48));
+            vacc13 = vfmaq_f32(vacc13, w, vld1q_f32(vt + 52));
+            vacc14 = vfmaq_f32(vacc14, w, vld1q_f32(vt + 56));
+            vacc15 = vfmaq_f32(vacc15, w, vld1q_f32(vt + 60));
+        }
+
+        vst1q_f32(xbh + 0,  vacc0);  vst1q_f32(xbh + 4,  vacc1);
+        vst1q_f32(xbh + 8,  vacc2);  vst1q_f32(xbh + 12, vacc3);
+        vst1q_f32(xbh + 16, vacc4);  vst1q_f32(xbh + 20, vacc5);
+        vst1q_f32(xbh + 24, vacc6);  vst1q_f32(xbh + 28, vacc7);
+        vst1q_f32(xbh + 32, vacc8);  vst1q_f32(xbh + 36, vacc9);
+        vst1q_f32(xbh + 40, vacc10); vst1q_f32(xbh + 44, vacc11);
+        vst1q_f32(xbh + 48, vacc12); vst1q_f32(xbh + 52, vacc13);
+        vst1q_f32(xbh + 56, vacc14); vst1q_f32(xbh + 60, vacc15);
+#else
+        for (int d = 0; d < head_dim; d++) xbh[d] = 0.0f;
+        for (int t = 0; t <= pos; t++) {
+            const float *vt = v_head + t * kv_dim;
+            float w = att_h[t];
+            for (int d = 0; d < head_dim; d++) {
+                xbh[d] += w * vt[d];
+            }
+        }
+#endif
+    };
+
+    if (pos >= 32) {
+        parallel_rows(n_heads, [&](int h_start, int h_end) {
+            for (int h = h_start; h < h_end; h++) {
+                process_head(h);
+            }
+        }, /*min_parallel=*/32);
+    } else {
+        for (int h = 0; h < n_heads; h++) {
+            process_head(h);
+        }
+    }
+}

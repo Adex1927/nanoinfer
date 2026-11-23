@@ -51,14 +51,17 @@ struct InferState {
 
     // ── KV cache ──
     // Stores the key and value projections for every layer and every past position.
-    // Layout: k_cache[layer * n_ctx * kv_dim + pos * kv_dim + d]
+    // Layout (float32): k_cache[layer * n_ctx * kv_dim + pos * kv_dim + d]
+    // Layout (Q8_0):    k_cache_q8[layer * n_ctx * (kv_dim / 32) + pos * (kv_dim / 32) + b]
     // where kv_dim = n_kv_heads * head_dim
     //
     // This is what enables autoregressive generation: we compute K and V once
     // per token and cache them, so we never recompute past context.
 
-    float *k_cache; // [n_layers * n_ctx * kv_dim]
-    float *v_cache; // [n_layers * n_ctx * kv_dim]
+    float     *k_cache;    // [n_layers * n_ctx * kv_dim]        (allocated when !kv_q8)
+    BlockQ8_0 *k_cache_q8; // [n_layers * n_ctx * (kv_dim / 32)] (allocated when kv_q8)
+    float     *v_cache;    // [n_layers * n_ctx * kv_dim]
+    bool       kv_q8;      // true by default (override via NANO_KV_Q8=0)
 
     // ── dimensions (stored for convenience) ──
 

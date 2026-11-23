@@ -3,6 +3,83 @@
 #include <cmath>
 #include <cstring>
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+// ── quantize_q8_0 ──
+// Quantizes float32 values into BlockQ8_0 blocks (32 values per 34-byte block).
+// Each block stores:
+//   - scale: float16(max(|x[0..31]|) / 127.0f)
+//   - quants[32]: round(x[j] * (127.0f / max_abs)) in [-127, 127]
+void quantize_q8_0(const float *src, BlockQ8_0 *dst, size_t n_elements) {
+    size_t n_blocks = n_elements / 32;
+    for (size_t b = 0; b < n_blocks; b++) {
+        const float *x = src + b * 32;
+        BlockQ8_0 *block = &dst[b];
+
+#if defined(__ARM_NEON)
+        float32x4_t x0 = vld1q_f32(x + 0);
+        float32x4_t x1 = vld1q_f32(x + 4);
+        float32x4_t x2 = vld1q_f32(x + 8);
+        float32x4_t x3 = vld1q_f32(x + 12);
+        float32x4_t x4 = vld1q_f32(x + 16);
+        float32x4_t x5 = vld1q_f32(x + 20);
+        float32x4_t x6 = vld1q_f32(x + 24);
+        float32x4_t x7 = vld1q_f32(x + 28);
+
+        float32x4_t m01 = vmaxq_f32(vabsq_f32(x0), vabsq_f32(x1));
+        float32x4_t m23 = vmaxq_f32(vabsq_f32(x2), vabsq_f32(x3));
+        float32x4_t m45 = vmaxq_f32(vabsq_f32(x4), vabsq_f32(x5));
+        float32x4_t m67 = vmaxq_f32(vabsq_f32(x6), vabsq_f32(x7));
+        float max_val = vmaxvq_f32(vmaxq_f32(vmaxq_f32(m01, m23), vmaxq_f32(m45, m67)));
+
+        if (max_val == 0.0f) {
+            block->scale = 0;
+            std::memset(block->quants, 0, sizeof(block->quants));
+            continue;
+        }
+
+        float d  = max_val / 127.0f;
+        float id = 127.0f / max_val;
+        block->scale = f32_to_f16(d);
+
+        float32x4_t vid = vdupq_n_f32(id);
+        int16x8_t q01 = vcombine_s16(vqmovn_s32(vcvtnq_s32_f32(vmulq_f32(x0, vid))),
+                                     vqmovn_s32(vcvtnq_s32_f32(vmulq_f32(x1, vid))));
+        int16x8_t q23 = vcombine_s16(vqmovn_s32(vcvtnq_s32_f32(vmulq_f32(x2, vid))),
+                                     vqmovn_s32(vcvtnq_s32_f32(vmulq_f32(x3, vid))));
+        int16x8_t q45 = vcombine_s16(vqmovn_s32(vcvtnq_s32_f32(vmulq_f32(x4, vid))),
+                                     vqmovn_s32(vcvtnq_s32_f32(vmulq_f32(x5, vid))));
+        int16x8_t q67 = vcombine_s16(vqmovn_s32(vcvtnq_s32_f32(vmulq_f32(x6, vid))),
+                                     vqmovn_s32(vcvtnq_s32_f32(vmulq_f32(x7, vid))));
+
+        vst1q_s8(block->quants + 0,  vcombine_s8(vqmovn_s16(q01), vqmovn_s16(q23)));
+        vst1q_s8(block->quants + 16, vcombine_s8(vqmovn_s16(q45), vqmovn_s16(q67)));
+#else
+        float max_val = 0.0f;
+        for (int j = 0; j < 32; j++) {
+            float v = fabsf(x[j]);
+            if (v > max_val) max_val = v;
+        }
+        if (max_val == 0.0f) {
+            block->scale = 0;
+            std::memset(block->quants, 0, sizeof(block->quants));
+            continue;
+        }
+        float d  = max_val / 127.0f;
+        float id = 127.0f / max_val;
+        block->scale = f32_to_f16(d);
+        for (int j = 0; j < 32; j++) {
+            int q = (int)roundf(x[j] * id);
+            if (q > 127)  q = 127;
+            if (q < -128) q = -128;
+            block->quants[j] = (int8_t)q;
+        }
+#endif
+    }
+}
+
 // ── dequantize_q8_0 ──
 // The simplest one. Each block = 34 bytes = [float16 scale][32 × int8]
 // For each weight: float_value = scale * quant_value
